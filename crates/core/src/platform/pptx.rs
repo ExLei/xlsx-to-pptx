@@ -273,7 +273,76 @@ impl Package {
                 return Ok(ControlFlow::Break(()));
             }
         }
+        // 页数守恒（I5）：词条比版式页少时，删掉尾部多余页。
+        self.truncate_to(total, diag)?;
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// 用与 [`Package::fill`] 相同的 run-aware 机制做子串替换（示例模板生成用）。
+    ///
+    /// 逐页对段落内 `<a:t>` 合并后的文本做替换（保留首个 run 的样式）；
+    /// 成对替换、不去重文本；`from` 为空或全包都找不到都不算失败，只记一条 info（含计数）。
+    pub fn replace_text(&mut self, pairs: &[(&str, &str)], diag: &Diag) -> Result<(), PptxError> {
+        if self.slides.is_empty() {
+            return Err(PptxError::NoSlides);
+        }
+        // 空 `from` 无从定位：跳过（否则 replace 会在每个字符之间插入）。
+        let pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .copied()
+            .filter(|(from, _)| !from.is_empty())
+            .collect();
+        let missing: Vec<&str> = pairs
+            .iter()
+            .map(|(from, _)| *from)
+            .filter(|from| !self.slides.iter().any(|slide| slide.text.contains(from)))
+            .collect();
+
+        for index in 0..self.slides.len() {
+            let part = self.slides[index].part;
+            let name = self.parts[part].name.clone();
+            let (data, text) = fill_slide(&self.parts[part].data, &pairs, &name).map_err(
+                |error| {
+                    report(
+                        diag,
+                        "replace",
+                        format!("替换第 {} 页失败: {error}", index + 1),
+                        Some(name.clone()),
+                    );
+                    error
+                },
+            )?;
+            self.parts[part].data = data;
+            self.slides[index].text = text;
+        }
+
+        let slides = self.slides.len();
+        diag.info(
+            Target::Pptx,
+            format!(
+                "replace_text: {} 对生效、{} 对未命中（{slides} 页）",
+                pairs.len() - missing.len(),
+                missing.len()
+            ),
+            Some(json!({
+                field::OP: "replace",
+                field::SLIDES: slides,
+                field::COUNT: pairs.len() - missing.len(),
+            })),
+        );
+        if !missing.is_empty() {
+            diag.info(
+                Target::Pptx,
+                format!("replace_text 未命中: {missing:?}"),
+                Some(json!({ field::OP: "replace", field::MISSING: missing })),
+            );
+        }
+        Ok(())
+    }
+
+    /// 序列化整包为字节（调用方自行落盘；示例模板生成也走这里）。
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PptxError> {
+        self.serialize()
     }
 
     /// 原子落盘 + 落盘后重开自检（页数守恒）。
@@ -539,26 +608,268 @@ impl Package {
         Ok(())
     }
 
-    /// 序列化整包：全部条目按原顺序写回（新增部件已在末尾）。
+    /// 序列化整包（失败记 diag）。
     fn to_zip(&self, diag: &Diag) -> Result<Vec<u8>, PptxError> {
+        self.serialize().map_err(|error| {
+            report(diag, "save", error.to_string(), None);
+            error
+        })
+    }
+
+    /// 序列化整包：全部条目按原顺序写回（新增部件已在末尾）。
+    fn serialize(&self) -> Result<Vec<u8>, PptxError> {
         let mut buffer = Cursor::new(Vec::new());
         {
             let mut writer = ZipWriter::new(&mut buffer);
             let options = SimpleFileOptions::default();
             for part in &self.parts {
                 writer.start_file(part.name.as_str(), options).map_err(|error| {
-                    zip_error(diag, format!("写入 ZIP 条目 {} 失败", part.name), error)
+                    zip_error(format!("写入 ZIP 条目 {} 失败", part.name), error)
                 })?;
                 writer.write_all(&part.data).map_err(|error| {
-                    zip_error(diag, format!("写入 ZIP 数据 {} 失败", part.name), error)
+                    zip_error(format!("写入 ZIP 数据 {} 失败", part.name), error)
                 })?;
             }
             writer
                 .finish()
-                .map_err(|error| zip_error(diag, "完成 ZIP 失败".to_string(), error))?;
+                .map_err(|error| zip_error("完成 ZIP 失败".to_string(), error))?;
         }
         Ok(buffer.into_inner())
     }
+}
+
+// ── 结构修补（截断多余页）────────────────────────────────────────────────
+
+impl Package {
+    /// 词条数少于版式页数：删除尾部多余页（I5 页数守恒）。
+    ///
+    /// 四处一致移除——幻灯片部件（连同它自己的 rels，如有）、`ppt/presentation.xml` 的
+    /// `sldId`、`ppt/_rels/presentation.xml.rels` 的幻灯片关系、`[Content_Types].xml` 的
+    /// Override；不留孤儿部件、悬空 rId 或多余 Override。
+    fn truncate_to(&mut self, keep: usize, diag: &Diag) -> Result<(), PptxError> {
+        if keep >= self.slides.len() {
+            return Ok(());
+        }
+        let dropped = self.slides.split_off(keep);
+        let mut slide_parts: Vec<String> = Vec::with_capacity(dropped.len());
+        let mut rels_parts: Vec<String> = Vec::new();
+        for slide in &dropped {
+            slide_parts.push(slide_part_name(slide.number));
+            let rels = slide_rels_part_name(slide.number);
+            if self.parts.iter().any(|part| part.name == rels) {
+                rels_parts.push(rels);
+            }
+        }
+
+        // 先把三份修补算完：任一失败都不留下半套结构。
+        let content_types = self
+            .part(CONTENT_TYPES)
+            .ok_or(PptxError::MissingStructure(CONTENT_TYPES))?;
+        let mut removals: Vec<String> = slide_parts
+            .iter()
+            .map(|part| format!("/{part}"))
+            .collect();
+        removals.extend(rels_parts.iter().map(|part| format!("/{part}")));
+        let patched_types = drop_overrides(&content_types.data, &removals).map_err(|error| {
+            let message = format!("删除多余页的内容类型失败: {error}");
+            report(diag, "fill", message, Some(CONTENT_TYPES.to_string()));
+            error
+        })?;
+        let presentation_rels = self
+            .part(PRESENTATION_RELS)
+            .ok_or(PptxError::MissingStructure(PRESENTATION_RELS))?;
+        let (patched_rels, rel_ids) =
+            drop_slide_relationships(&presentation_rels.data, &slide_parts).map_err(|error| {
+                let message = format!("删除多余页的关系失败: {error}");
+                report(diag, "fill", message, Some(PRESENTATION_RELS.to_string()));
+                error
+            })?;
+        let presentation = self
+            .part(PRESENTATION)
+            .ok_or(PptxError::MissingStructure(PRESENTATION))?;
+        let patched_presentation =
+            drop_sld_ids(&presentation.data, &rel_ids).map_err(|error| {
+                let message = format!("删除多余页的 sldId 失败: {error}");
+                report(diag, "fill", message, Some(PRESENTATION.to_string()));
+                error
+            })?;
+
+        if let Some(part) = self.parts.iter_mut().find(|part| part.name == CONTENT_TYPES) {
+            part.data = patched_types;
+        }
+        if let Some(part) = self
+            .parts
+            .iter_mut()
+            .find(|part| part.name == PRESENTATION_RELS)
+        {
+            part.data = patched_rels;
+        }
+        if let Some(part) = self.parts.iter_mut().find(|part| part.name == PRESENTATION) {
+            part.data = patched_presentation;
+        }
+        self.parts
+            .retain(|part| !slide_parts.contains(&part.name) && !rels_parts.contains(&part.name));
+        // `retain` 会移动元素：留守幻灯片的下标按名字重建。
+        for slide in &mut self.slides {
+            let name = slide_part_name(slide.number);
+            slide.part = self
+                .parts
+                .iter()
+                .position(|part| part.name == name)
+                .ok_or(PptxError::MissingStructure(MISSING_SLIDE_PART))?;
+        }
+
+        diag.info(
+            Target::Pptx,
+            format!(
+                "词条数 {keep} 少于版式页数 {}，已删除尾部 {} 页",
+                keep + dropped.len(),
+                dropped.len()
+            ),
+            Some(json!({
+                field::OP: "fill",
+                field::SLIDES: keep,
+                field::COUNT: dropped.len(),
+            })),
+        );
+        Ok(())
+    }
+}
+
+/// 关系 Target 是否指向该幻灯片部件（`slides/slideN.xml` 与 `/ppt/slides/slideN.xml` 两种写法都认）。
+fn target_matches_slide(target: &str, slide_part: &str) -> bool {
+    let target = target.trim_start_matches('/');
+    let relative = slide_part.strip_prefix("ppt/").unwrap_or(slide_part);
+    target == slide_part || target == relative
+}
+
+/// 元素引用的关系 id：按 relationships 命名空间解析属性键；
+/// 解析不出来时退化为「带前缀且本地名为 `id`」的属性（`r:id` / `rel:id` 都认）。
+fn referenced_id(
+    element: &BytesStart,
+    namespaces: &[(String, String)],
+    part: &str,
+) -> Result<Option<String>, PptxError> {
+    if let Some(key) = namespaced_key(element, namespaces, REL_NS, "id", part)? {
+        return attribute_value(element, &key, part);
+    }
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| xml_error(part, error))?;
+        let key = String::from_utf8_lossy(attribute.key.as_ref()).into_owned();
+        if key.contains(':') && local_name(key.as_bytes()) == b"id" {
+            return decode_value(&attribute.value, part).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// 流式重写 XML：`doomed` 判真的元素（连同子树）整段从输出里删掉。
+fn drop_elements(
+    xml: &[u8],
+    part: &str,
+    mut doomed: impl FnMut(&BytesStart) -> Result<bool, PptxError>,
+) -> Result<Vec<u8>, PptxError> {
+    let mut reader = Reader::from_reader(xml);
+    reader.trim_text(false);
+    let mut writer = Writer::new(Vec::with_capacity(xml.len()));
+    let mut buf = Vec::new();
+    let mut depth = 0usize;
+
+    loop {
+        let event = reader
+            .read_event_into(&mut buf)
+            .map_err(|error| xml_error(part, error))?;
+        if let Event::Eof = event {
+            break;
+        }
+        match &event {
+            Event::Start(start) => {
+                if depth > 0 {
+                    depth += 1;
+                    continue;
+                }
+                if doomed(start)? {
+                    depth = 1;
+                    continue;
+                }
+            }
+            Event::Empty(start) => {
+                if depth > 0 {
+                    continue;
+                }
+                if doomed(start)? {
+                    continue;
+                }
+            }
+            Event::End(_) => {
+                if depth > 0 {
+                    depth -= 1;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        writer
+            .write_event(&event)
+            .map_err(|error| xml_error(part, error))?;
+    }
+    Ok(writer.into_inner())
+}
+
+/// 删除 `PartName` 命中这些部件的 Override；返回新 XML。
+fn drop_overrides(xml: &[u8], part_names: &[String]) -> Result<Vec<u8>, PptxError> {
+    drop_elements(xml, CONTENT_TYPES, |start| {
+        if local_name(start.name().as_ref()) != b"Override" {
+            return Ok(false);
+        }
+        let part_name = attribute_value(start, "PartName", CONTENT_TYPES)?;
+        Ok(part_name
+            .as_deref()
+            .is_some_and(|name| part_names.iter().any(|doomed| doomed == name)))
+    })
+}
+
+/// 删除指向这些幻灯片部件的关系；返回（新 XML，被删关系的 Id）。
+fn drop_slide_relationships(
+    xml: &[u8],
+    slide_parts: &[String],
+) -> Result<(Vec<u8>, Vec<String>), PptxError> {
+    let mut removed: Vec<String> = Vec::new();
+    let patched = drop_elements(xml, PRESENTATION_RELS, |start| {
+        if local_name(start.name().as_ref()) != b"Relationship" {
+            return Ok(false);
+        }
+        let kind = attribute_value(start, "Type", PRESENTATION_RELS)?;
+        let target = attribute_value(start, "Target", PRESENTATION_RELS)?;
+        let doomed = kind.as_deref() == Some(REL_SLIDE)
+            && target.as_deref().is_some_and(|target| {
+                slide_parts
+                    .iter()
+                    .any(|part| target_matches_slide(target, part))
+            });
+        if doomed {
+            if let Some(id) = attribute_value(start, "Id", PRESENTATION_RELS)? {
+                removed.push(id);
+            }
+        }
+        Ok(doomed)
+    })?;
+    Ok((patched, removed))
+}
+
+/// 删除 `r:id` 命中这些关系 id 的 `sldId`；返回新 XML。
+fn drop_sld_ids(xml: &[u8], rel_ids: &[String]) -> Result<Vec<u8>, PptxError> {
+    let mut namespaces: Vec<(String, String)> = Vec::new();
+    drop_elements(xml, PRESENTATION, |start| {
+        collect_namespaces(start, &mut namespaces, PRESENTATION)?;
+        if local_name(start.name().as_ref()) != b"sldId" {
+            return Ok(false);
+        }
+        match referenced_id(start, &namespaces, PRESENTATION)? {
+            Some(id) => Ok(rel_ids.iter().any(|doomed| *doomed == id)),
+            None => Ok(false),
+        }
+    })
 }
 
 /// 结构化修补 `[Content_Types].xml`：为新幻灯片（及其 rels）补 Override 项。
@@ -1127,10 +1438,9 @@ fn xml_error(part: &str, error: impl std::fmt::Display) -> PptxError {
     PptxError::Xml(format!("{part}: {error}"))
 }
 
-/// 记一条 ZIP 错误事件并构造 [`PptxError::Zip`]。
-fn zip_error(diag: &Diag, message: String, error: impl std::fmt::Display) -> PptxError {
-    report(diag, "save", format!("{message}: {error}"), None);
-    PptxError::Zip(error.to_string())
+/// 构造 [`PptxError::Zip`]（记事件由调用点负责：`to_bytes` 没有 diag 句柄）。
+fn zip_error(message: String, error: impl std::fmt::Display) -> PptxError {
+    PptxError::Zip(format!("{message}: {error}"))
 }
 
 /// 记一条 pptx 错误事件（发生处 = `op`，部件 = `part`）。

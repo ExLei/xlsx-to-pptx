@@ -12,7 +12,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use x2p_core::diag::{Diag, DiagSink, Level, MemorySink};
 use x2p_core::domain::plan::{OutputError, OutputPlan, OverwritePolicy};
-use x2p_core::domain::schema::{Field, WordEntry};
+use x2p_core::domain::schema::{Field, WordEntry, FIELDS};
 use x2p_core::platform::pptx::{Package, PptxError, TokenScheme, EMBEDDED_TEMPLATE};
 use x2p_core::ports::{OpObserver, Progress};
 use zip::write::SimpleFileOptions;
@@ -198,6 +198,34 @@ fn part_text(bytes: &[u8], name: &str) -> Option<String> {
     let mut text = String::new();
     file.read_to_string(&mut text).ok()?;
     Some(text)
+}
+
+/// 包内全部条目名。
+fn part_names(bytes: &[u8]) -> Vec<String> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+    (0..archive.len())
+        .map(|index| archive.by_index(index).unwrap().name().to_string())
+        .collect()
+}
+
+/// 粗扫 `__XXX__` 形态的内部标记（大写与下划线组成；返回第一处残留）。
+fn marker_residue(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index + 4 <= bytes.len() {
+        if &bytes[index..index + 2] == b"__" {
+            let start = index + 2;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_uppercase() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end > start && end + 2 <= bytes.len() && &bytes[end..end + 2] == b"__" {
+                return Some(text[index..end + 2].to_string());
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 fn local(name: &[u8]) -> &[u8] {
@@ -484,37 +512,104 @@ fn fill_leaves_automatic_field_text_alone() {
 }
 
 #[test]
-fn fill_keeps_surplus_template_pages_untouched() {
-    // 对等旧版：词条数 < 版式页数时，多余的版式页原样留下（不填充、不删除）。
+fn fill_truncates_surplus_template_pages() {
+    // I5 页数守恒：5 页模板 + 2 词条 → 2 页输出。多余页四处一致移除，
+    // 不留孤儿部件、悬空 rId 或多余 Override（旧版保留多余页属缺陷，不再 mirror）。
     let (diag, _) = diagnostics();
-    let fixture = Fixture::new()
-        .slide(1, &slide_xml(&["{{单词}}"]))
-        .slide(2, &slide_xml(&["{{单词}}"]))
-        .slide(3, &slide_xml(&["{{单词}}"]))
+    let fixture = (1..=5)
+        .fold(Fixture::new(), |fixture, number| {
+            fixture
+                .slide(number, &slide_xml(&["{{单词}}", "{{音标}}"]))
+                .slide_rels(number, SLIDE_RELS)
+        })
         .build();
     let mut package = Package::open_bytes(&fixture, &diag).unwrap();
+    assert_eq!(package.slide_count(), 5);
 
     let mut observer = Recording::passive();
+    let entries = [entry("apple"), entry("banana")];
     assert_eq!(
         package
-            .fill(&[entry("apple")], TokenScheme::Placeholders, &mut observer, &diag)
+            .fill(&entries, TokenScheme::Placeholders, &mut observer, &diag)
             .unwrap(),
         ControlFlow::Continue(())
     );
-    assert_eq!(package.slide_count(), 3);
+    assert_eq!(package.slide_count(), 2, "fill 之后页数 = 词条数");
 
     let dir = tempfile::tempdir().unwrap();
-    let plan = OutputPlan::new(dir.path(), "fewer.pptx", OverwritePolicy::Fail);
+    let plan = OutputPlan::new(dir.path(), "truncated.pptx", OverwritePolicy::Fail);
     let artifact = package.save_atomic(&plan, &diag).unwrap();
-    assert_eq!(artifact.slides, 3);
+    assert_eq!(artifact.slides, 2);
+    assert!(part_files(dir.path()).is_empty());
     let bytes = fs::read(&artifact.path).unwrap();
-    assert!(text_of(&part_text(&bytes, "ppt/slides/slide1.xml").unwrap()).contains("apple"));
-    assert!(part_text(&bytes, "ppt/slides/slide2.xml")
-        .unwrap()
-        .contains("{{单词}}"));
-    assert!(part_text(&bytes, "ppt/slides/slide3.xml")
-        .unwrap()
-        .contains("{{单词}}"));
+    // 重开：页数守恒
+    assert_eq!(Package::open(&artifact.path, &diag).unwrap().slide_count(), 2);
+
+    // 部件：保留 1..2 页及其 rels，3..5 页连 rels 一起消失
+    let names = part_names(&bytes);
+    for number in 1..=2 {
+        assert!(names.contains(&format!("ppt/slides/slide{number}.xml")));
+        assert!(names.contains(&format!("ppt/slides/_rels/slide{number}.xml.rels")));
+    }
+    for number in 3..=5 {
+        assert!(
+            !names.contains(&format!("ppt/slides/slide{number}.xml")),
+            "孤儿部件 slide{number}.xml: {names:?}"
+        );
+        assert!(!names.contains(&format!("ppt/slides/_rels/slide{number}.xml.rels")));
+    }
+
+    // [Content_Types].xml：只剩两页（及其 rels）的 Override
+    let types = part_text(&bytes, "[Content_Types].xml").unwrap();
+    let overrides = attributes_of(&types, "Override");
+    let slide_overrides: Vec<&str> = overrides
+        .iter()
+        .filter_map(|attributes| attribute(attributes, "PartName"))
+        .filter(|name| name.starts_with("/ppt/slides/"))
+        .collect();
+    assert_eq!(
+        slide_overrides,
+        vec![
+            "/ppt/slides/slide1.xml",
+            "/ppt/slides/slide2.xml",
+            "/ppt/slides/_rels/slide1.xml.rels",
+            "/ppt/slides/_rels/slide2.xml.rels",
+        ]
+    );
+
+    // presentation.xml / rels：只剩两页，且 sldId 的 r:id 都有落点（无悬空 rId）
+    let presentation = part_text(&bytes, "ppt/presentation.xml").unwrap();
+    let sld_ids = attributes_of(&presentation, "sldId");
+    assert_eq!(sld_ids.len(), 2, "sldIdLst 有多余项: {sld_ids:?}");
+    let relationships = part_text(&bytes, "ppt/_rels/presentation.xml.rels")
+        .map(|rels| attributes_of(&rels, "Relationship"))
+        .unwrap();
+    let slide_relationships: Vec<&Vec<(String, String)>> = relationships
+        .iter()
+        .filter(|attributes| attribute(attributes, "Type") == Some(REL_SLIDE))
+        .collect();
+    assert_eq!(slide_relationships.len(), 2, "关系表有多余项: {relationships:?}");
+    let targets: Vec<&str> = slide_relationships
+        .iter()
+        .map(|attributes| attribute(attributes, "Target").unwrap())
+        .collect();
+    assert_eq!(targets, vec!["slides/slide1.xml", "slides/slide2.xml"]);
+    let live_ids: Vec<&str> = slide_relationships
+        .iter()
+        .map(|attributes| attribute(attributes, "Id").unwrap())
+        .collect();
+    for sld_id in &sld_ids {
+        let reference = attribute(sld_id, "r:id").unwrap();
+        assert!(live_ids.contains(&reference), "悬空 rId: {reference}");
+    }
+    // 非幻灯片关系原样保留
+    assert!(relationships
+        .iter()
+        .any(|attributes| attribute(attributes, "Type").is_some_and(|kind| kind.ends_with("presProps"))));
+
+    // 内容：剩下的两页各填到自己的词条
+    assert!(text_of(&part_text(&bytes, "ppt/slides/slide1.xml").unwrap()).starts_with("apple"));
+    assert!(text_of(&part_text(&bytes, "ppt/slides/slide2.xml").unwrap()).starts_with("banana"));
 }
 
 #[test]
@@ -734,26 +829,48 @@ fn save_atomic_propagates_exists_under_fail_policy() {
 fn embedded_template_opens_scans_and_fills_markers() {
     let (diag, _) = diagnostics();
     let mut package = Package::open_bytes(EMBEDDED_TEMPLATE, &diag).unwrap();
-    assert!(package.slide_count() >= 1);
-    let fields = package.scan_tokens(TokenScheme::Markers);
-    assert!(fields.contains(&Field::Word), "内嵌版式缺少 __WORD__: {fields:?}");
-    assert!(fields.contains(&Field::Phonetic), "内嵌版式缺少 __PHONETIC__: {fields:?}");
+    let template_pages = package.slide_count();
+    assert!(template_pages >= 2, "内嵌版式至少要两页");
+    // 内嵌版式必须带全六个字段的标记（资产与 FIELDS 表同源）
+    assert_eq!(package.scan_tokens(TokenScheme::Markers), Field::ALL.to_vec());
 
     let mut observer = Recording::passive();
+    let entries = [entry("apple"), entry("banana")];
     assert_eq!(
         package
-            .fill(&[entry("apple")], TokenScheme::Markers, &mut observer, &diag)
+            .fill(&entries, TokenScheme::Markers, &mut observer, &diag)
             .unwrap(),
         ControlFlow::Continue(())
     );
+    assert_eq!(package.slide_count(), entries.len(), "页数 = 词条数（多余页被截断）");
 
     let dir = tempfile::tempdir().unwrap();
     let plan = OutputPlan::new(dir.path(), "embedded.pptx", OverwritePolicy::Fail);
     let artifact = package.save_atomic(&plan, &diag).unwrap();
+    assert_eq!(artifact.slides, 2);
     let bytes = fs::read(&artifact.path).unwrap();
-    let xml = part_text(&bytes, "ppt/slides/slide1.xml").unwrap();
-    assert!(text_of(&xml).contains("apple"), "首屏应填入词条");
-    assert!(!xml.contains("__WORD__"), "标记应被替换: {xml}");
+    assert_eq!(Package::open(&artifact.path, &diag).unwrap().slide_count(), 2);
+
+    // 产物里不得残留任何 __XXX__ 形态的内部标记，也不得有孤儿幻灯片部件
+    let mut slides: Vec<String> = part_names(&bytes)
+        .into_iter()
+        .filter(|name| name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
+        .collect();
+    slides.sort();
+    assert_eq!(slides, vec!["ppt/slides/slide1.xml", "ppt/slides/slide2.xml"]);
+    for name in &slides {
+        let xml = part_text(&bytes, name).unwrap();
+        assert_eq!(marker_residue(&xml), None, "{name} 残留内部标记");
+        assert_eq!(marker_residue(&text_of(&xml)), None, "{name} 残留内部标记");
+    }
+
+    // 版式里的标签是静态文本，必须原样保留
+    let first = text_of(&part_text(&bytes, "ppt/slides/slide1.xml").unwrap());
+    assert!(first.contains("apple"), "首屏应填入词条: {first}");
+    assert!(
+        first.contains("单词释义：n. apple"),
+        "标签应保留（词条值接在标签后）: {first}"
+    );
 }
 
 /// 内嵌版式（真实包结构）走复制末页分支：三处结构必须自洽。
@@ -849,14 +966,107 @@ fn embedded_template_copy_path_patches_structure() {
         );
     }
 
-    // 每页都填到了自己的词条
+    // 每页都填到了自己的词条，且没有内部标记残留
     for number in 1..=wanted {
-        let text = text_of(
-            &part_text(&bytes, &format!("ppt/slides/slide{number}.xml")).unwrap(),
-        );
+        let xml = part_text(&bytes, &format!("ppt/slides/slide{number}.xml")).unwrap();
+        let text = text_of(&xml);
         assert!(
             text.contains(&format!("word{}", number - 1)),
             "第 {number} 页未填入对应词条: {text}"
         );
+        assert_eq!(marker_residue(&xml), None, "第 {number} 页残留内部标记");
+        assert_eq!(marker_residue(&text), None, "第 {number} 页残留内部标记");
     }
+}
+
+// ── 序列化 / 纯文本替换 ─────────────────────────────────────────────────
+
+#[test]
+fn to_bytes_serializes_the_whole_package() {
+    let (diag, _) = diagnostics();
+    let fixture = Fixture::new()
+        .slide(1, &slide_xml(&["{{单词}}"]))
+        .build();
+    let mut package = Package::open_bytes(&fixture, &diag).unwrap();
+    let mut observer = Recording::passive();
+    assert_eq!(
+        package
+            .fill(&[entry("apple"), entry("banana")], TokenScheme::Placeholders, &mut observer, &diag)
+            .unwrap(),
+        ControlFlow::Continue(())
+    );
+
+    let bytes = package.to_bytes().unwrap();
+    assert_eq!(&bytes[..2], b"PK", "产物必须是 ZIP");
+    let reopened = Package::open_bytes(&bytes, &diag).unwrap();
+    assert_eq!(reopened.slide_count(), 2, "to_bytes 应带上复制出来的页");
+    assert_eq!(
+        text_of(&part_text(&bytes, "ppt/slides/slide2.xml").unwrap()),
+        "banana"
+    );
+}
+
+#[test]
+fn replace_text_turns_embedded_markers_into_placeholders() {
+    let (diag, sink) = diagnostics();
+    let mut package = Package::open_bytes(EMBEDDED_TEMPLATE, &diag).unwrap();
+    let pages = package.slide_count();
+    let pairs: Vec<(&str, &str)> = FIELDS
+        .iter()
+        .map(|meta| (meta.marker, meta.placeholder))
+        .collect();
+    package.replace_text(&pairs, &diag).unwrap();
+
+    let bytes = package.to_bytes().unwrap();
+    let reopened = Package::open_bytes(&bytes, &diag).unwrap();
+    assert_eq!(reopened.slide_count(), pages, "替换不改页数");
+    assert_eq!(
+        reopened.scan_tokens(TokenScheme::Placeholders),
+        Field::ALL.to_vec(),
+        "六种占位符都应出现"
+    );
+    assert!(reopened.scan_tokens(TokenScheme::Markers).is_empty());
+
+    for number in 1..=pages {
+        let name = format!("ppt/slides/slide{number}.xml");
+        let xml = part_text(&bytes, &name).unwrap();
+        assert_eq!(marker_residue(&xml), None, "{name} 残留内部标记");
+        let text = text_of(&xml);
+        assert_eq!(marker_residue(&text), None, "{name} 残留内部标记");
+        assert!(
+            text.contains("单词释义：{{单词释义}}"),
+            "标签是静态文本、占位符紧随其后: {text}"
+        );
+        assert!(text.contains("例句：{{例句}}"), "标签是静态文本: {text}");
+    }
+    // 成对替换全部命中 → 未命中计数为 0
+    assert!(
+        sink.events()
+            .iter()
+            .any(|event| event.level == Level::Info && event.message.contains("6 对生效")),
+        "应记一条命中计数 info"
+    );
+}
+
+#[test]
+fn replace_text_tolerates_empty_and_missing_pairs() {
+    let (diag, sink) = diagnostics();
+    let fixture = Fixture::new()
+        .slide(1, &slide_xml(&["__WORD__"]))
+        .build();
+    let mut package = Package::open_bytes(&fixture, &diag).unwrap();
+
+    // 空 from 不插入任何东西；找不到的 from 不算失败（记 info 计数）
+    package
+        .replace_text(&[("", "不该出现"), ("__MISSING__", "x"), ("__WORD__", "填上了")], &diag)
+        .unwrap();
+
+    let bytes = package.to_bytes().unwrap();
+    let xml = part_text(&bytes, "ppt/slides/slide1.xml").unwrap();
+    assert!(!xml.contains("不该出现"), "空 from 不得插入文本: {xml}");
+    assert_eq!(text_of(&xml), "填上了");
+    assert!(sink
+        .events()
+        .iter()
+        .any(|event| event.level == Level::Info && event.message.contains("__MISSING__")));
 }
