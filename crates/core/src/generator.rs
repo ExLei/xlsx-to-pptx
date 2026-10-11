@@ -1,4 +1,4 @@
-use crate::diag::DiagStore;
+use crate::diag::Diag;
 use crate::template_reader::{replace_placeholders, scan_placeholders};
 use crate::types::{GenerateError, TemplateError, WordEntry};
 use std::fs;
@@ -13,21 +13,34 @@ pub fn generate(
     entries: &[WordEntry],
     output: &Path,
     progress: impl Fn(usize, usize) -> bool,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<(), GenerateError> {
     diag.info(
         "generator",
-        &format!(
+        format!(
             "generating {} entries → {}",
             entries.len(),
             output.display()
         ),
-        None,
+        Some(serde_json::json!({
+            "entries": entries.len(),
+            "output": output.display().to_string(),
+        })),
     );
     if entries.is_empty() {
+        diag.error(
+            "generator",
+            "没有可生成的条目",
+            Some(serde_json::json!({"entries": 0})),
+        );
         return Err(GenerateError::NoEntries);
     }
     if output.exists() {
+        diag.error(
+            "generator",
+            format!("输出文件已存在: {}", output.display()),
+            Some(serde_json::json!({"output": output.display().to_string()})),
+        );
         return Err(GenerateError::FileExists(
             output.to_string_lossy().into_owned(),
         ));
@@ -35,19 +48,18 @@ pub fn generate(
 
     let total = entries.len();
     let reader = Cursor::new(TEMPLATE);
-    let mut archive =
-        ZipArchive::new(reader).map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+    let mut archive = ZipArchive::new(reader).map_err(|e| zip_error(diag, "ZIP 操作", e))?;
 
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
-            .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+            .map_err(|e| zip_error(diag, "ZIP 操作", e))?;
         let name = entry.name().to_string();
         let mut data = Vec::new();
         entry
             .read_to_end(&mut data)
-            .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+            .map_err(|e| zip_error(diag, "ZIP 操作", e))?;
         files.push((name, data));
     }
 
@@ -70,6 +82,15 @@ pub fn generate(
             *data = xml.into_bytes();
         }
         if !progress(i + 1, total) {
+            diag.warn(
+                "generator",
+                format!("生成已取消（{}/{}）", i + 1, total),
+                Some(serde_json::json!({
+                    "cancelled": true,
+                    "processed": i + 1,
+                    "total": total,
+                })),
+            );
             return Err(GenerateError::Cancelled);
         }
     }
@@ -80,18 +101,28 @@ pub fn generate(
         let o = SimpleFileOptions::default();
         for (name, data) in &files {
             z.start_file(name, o)
-                .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+                .map_err(|e| zip_error(diag, "ZIP 操作", e))?;
             z.write_all(data)
-                .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+                .map_err(|e| zip_error(diag, "ZIP 操作", e))?;
         }
-        z.finish()
-            .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+        z.finish().map_err(|e| zip_error(diag, "ZIP 操作", e))?;
     }
-    fs::write(output, buf.into_inner())?;
+    ensure_parent_dir(output, diag)?;
+    fs::write(output, buf.into_inner()).map_err(|error| {
+        diag.error(
+            "generator",
+            format!("写入失败 {}: {error}", output.display()),
+            Some(serde_json::json!({"output": output.display().to_string()})),
+        );
+        GenerateError::IoError(error)
+    })?;
     diag.info(
         "generator",
-        &format!("done: {} slides → {}", total, output.display()),
-        None,
+        format!("done: {} slides → {}", total, output.display()),
+        Some(serde_json::json!({
+            "slides": total,
+            "output": output.display().to_string(),
+        })),
     );
     Ok(())
 }
@@ -106,17 +137,46 @@ pub fn generate_from_template(
     template_path: &Path,
     output: &Path,
     progress: impl Fn(usize, usize) -> bool,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<(), GenerateError> {
+    diag.info(
+        "generator",
+        format!(
+            "generate_from_template: {} entries → {}（模板 {}）",
+            entries.len(),
+            output.display(),
+            template_path.display()
+        ),
+        Some(serde_json::json!({
+            "entries": entries.len(),
+            "output": output.display().to_string(),
+            "template": template_path.display().to_string(),
+        })),
+    );
     if entries.is_empty() {
+        diag.error(
+            "generator",
+            "没有可生成的条目",
+            Some(serde_json::json!({"entries": 0})),
+        );
         return Err(GenerateError::NoEntries);
     }
     if output.exists() {
+        diag.error(
+            "generator",
+            format!("输出文件已存在: {}", output.display()),
+            Some(serde_json::json!({"output": output.display().to_string()})),
+        );
         return Err(GenerateError::FileExists(
             output.to_string_lossy().into_owned(),
         ));
     }
     if !template_path.exists() {
+        diag.error(
+            "generator",
+            format!("模板文件不存在: {}", template_path.display()),
+            Some(serde_json::json!({"template": template_path.display().to_string()})),
+        );
         return Err(GenerateError::PptxError(format!(
             "模板文件不存在: {}",
             template_path.display()
@@ -126,8 +186,7 @@ pub fn generate_from_template(
     let total = entries.len();
     let template_data = fs::read(template_path)?;
     let reader = Cursor::new(&template_data);
-    let mut archive =
-        ZipArchive::new(reader).map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+    let mut archive = ZipArchive::new(reader).map_err(|e| zip_error(diag, "ZIP 操作", e))?;
 
     // Extract all files from the template ZIP
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -137,12 +196,12 @@ pub fn generate_from_template(
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
-            .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+            .map_err(|e| zip_error(diag, "ZIP 操作", e))?;
         let name = entry.name().to_string();
         let mut data = Vec::new();
         entry
             .read_to_end(&mut data)
-            .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+            .map_err(|e| zip_error(diag, "ZIP 操作", e))?;
 
         if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
             slide_indices.push(files.len());
@@ -152,6 +211,11 @@ pub fn generate_from_template(
     }
 
     if slide_indices.is_empty() {
+        diag.error(
+            "generator",
+            "模板不包含任何幻灯片",
+            Some(serde_json::json!({"template": template_path.display().to_string()})),
+        );
         return Err(GenerateError::PptxError("模板不包含任何幻灯片".to_string()));
     }
 
@@ -167,6 +231,11 @@ pub fn generate_from_template(
         }
     }
     if !has_word {
+        diag.error(
+            "template",
+            "required placeholder {{单词}} missing",
+            Some(serde_json::json!({"required": "单词"})),
+        );
         return Err(TemplateError::MissingPlaceholder.into());
     }
 
@@ -212,11 +281,15 @@ pub fn generate_from_template(
     if total > template_slide_count {
         diag.info(
             "generator",
-            &format!(
+            format!(
                 "条目数({total})超过模板幻灯片数({template_slide_count})，将复制最后一张幻灯片填充剩余 {extra} 页",
                 extra = total - template_slide_count,
             ),
-            None,
+            Some(serde_json::json!({
+                "entries": total,
+                "template_slides": template_slide_count,
+                "extra": total - template_slide_count,
+            })),
         );
     }
 
@@ -336,6 +409,15 @@ pub fn generate_from_template(
         }
 
         if !progress(i + 1, total) {
+            diag.warn(
+                "generator",
+                format!("生成已取消（{}/{}）", i + 1, total),
+                Some(serde_json::json!({
+                    "cancelled": true,
+                    "processed": i + 1,
+                    "total": total,
+                })),
+            );
             return Err(GenerateError::Cancelled);
         }
     }
@@ -347,13 +429,56 @@ pub fn generate_from_template(
         let o = SimpleFileOptions::default();
         for (name, data) in &files {
             z.start_file(name, o)
-                .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+                .map_err(|e| zip_error(diag, "ZIP 操作", e))?;
             z.write_all(data)
-                .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+                .map_err(|e| zip_error(diag, "ZIP 操作", e))?;
         }
-        z.finish()
-            .map_err(|e| GenerateError::PptxError(format!("ZIP: {e}")))?;
+        z.finish().map_err(|e| zip_error(diag, "ZIP 操作", e))?;
     }
-    fs::write(output, buf.into_inner())?;
+    ensure_parent_dir(output, diag)?;
+    fs::write(output, buf.into_inner()).map_err(|error| {
+        diag.error(
+            "generator",
+            format!("写入失败 {}: {error}", output.display()),
+            Some(serde_json::json!({"output": output.display().to_string()})),
+        );
+        GenerateError::IoError(error)
+    })?;
+    diag.info(
+        "generator",
+        format!("done: {} slides → {}", total, output.display()),
+        Some(serde_json::json!({
+            "slides": total,
+            "output": output.display().to_string(),
+        })),
+    );
     Ok(())
+}
+
+/// 记录并包装 ZIP 错误。
+fn zip_error(diag: &Diag, context: &str, error: impl std::fmt::Display) -> GenerateError {
+    diag.error(
+        "generator",
+        format!("{context}: {error}"),
+        Some(serde_json::json!({"context": context})),
+    );
+    GenerateError::PptxError(format!("ZIP: {error}"))
+}
+
+/// 输出文件所在目录不存在时创建；生成器让自己写出的文件可落盘。
+fn ensure_parent_dir(output: &Path, diag: &Diag) -> Result<(), GenerateError> {
+    let Some(parent) = output.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() || parent.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent).map_err(|error| {
+        diag.error(
+            "generator",
+            format!("创建输出目录失败 {}: {error}", parent.display()),
+            Some(serde_json::json!({"output_dir": parent.display().to_string()})),
+        );
+        GenerateError::IoError(error)
+    })
 }

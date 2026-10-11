@@ -45,6 +45,11 @@ pub fn generate_example_pptx(output: &Path) -> Result<(), std::io::Error> {
     }
 
     // Write output
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
     let file = fs::File::create(output)?;
     let mut zip = ZipWriter::new(file);
     let opts = SimpleFileOptions::default();

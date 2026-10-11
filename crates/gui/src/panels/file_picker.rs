@@ -42,7 +42,11 @@ pub fn render(app: &VocabApp, window: &mut Window, cx: &mut Context<VocabApp>) -
                     .text_color(cx.theme().muted_foreground)
                     .child("编码"),
             )
-            .child(Select::new(&app.encoding_select).w_32())
+            .child(
+                Select::new(&app.encoding_select)
+                    .id("encoding-select")
+                    .w_32(),
+            )
             .into_any_element(),
     };
 
@@ -68,6 +72,16 @@ pub fn render(app: &VocabApp, window: &mut Window, cx: &mut Context<VocabApp>) -
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.pick_input(window, cx)),
                                 ),
+                        )
+                        .child(
+                            Button::new("excel-template")
+                                .ghost()
+                                .icon(IconName::FileText)
+                                .label("Excel 模板")
+                                .tooltip("生成 Excel 词汇表模板并打开")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_excel_template(window, cx)
+                                })),
                         ),
                 ),
             )

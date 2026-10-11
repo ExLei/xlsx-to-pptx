@@ -1,5 +1,6 @@
 pub mod diag;
 pub mod generator;
+pub mod paths;
 pub mod png_export;
 pub mod reader;
 pub mod renderer;

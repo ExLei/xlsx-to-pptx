@@ -10,17 +10,22 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::progress::Progress as ProgressBar;
 use gpui_kit::component::select::{SelectEvent, SelectState};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::table::TableState;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use vocab_core::diag::DiagStore;
+use vocab_core::diag::{self, Diag};
+use vocab_core::paths::Layout;
 use vocab_core::types::{GenerateError, InputSource, LoadError, TemplateError, WordEntry};
-use vocab_core::{generator, png_export, reader, renderer, template, template_pptx};
+use vocab_core::{
+    generator, png_export, reader, renderer, template, template_pptx, template_reader,
+};
 
 use crate::panels::data_preview::PreviewDelegate;
 use crate::panels::{data_preview, file_picker, output_config};
+use crate::APP_TITLE;
 
 /// CSV 编码候选，与 reader::load_csv 接受的标签一致。
 const CSV_ENCODINGS: [&str; 4] = ["UTF-8", "GBK", "GB2312", "GB18030"];
@@ -30,6 +35,18 @@ const PROGRESS_POLL: Duration = Duration::from_millis(80);
 
 /// 输入文件外部修改的检查间隔。
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 生成快捷键的展示文本：secondary 在 macOS 是 ⌘，其他平台是 Ctrl。
+const GENERATE_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "Cmd+Enter"
+} else {
+    "Ctrl+Enter"
+};
+
+/// 根元素按键上下文：Ctrl/Cmd+Enter 生成。
+const APP_CONTEXT: &str = "VocabApp";
+
+actions!(vocab, [GeneratePpt]);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
@@ -81,6 +98,43 @@ impl Status {
     }
 }
 
+/// 选定模板的校验状态；决定「生成」是否可用，并在界面上给出理由。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TemplateState {
+    /// 未选择模板：使用内置版式。
+    Unset,
+    /// 正在后台扫描模板文件。
+    Scanning,
+    /// 模板可用：这些占位符会被填入。
+    Ready(Vec<String>),
+    /// 模板不可用（不存在 / 损坏 / 缺 {{单词}}），附带可展示的原因。
+    Invalid(String),
+}
+
+/// 外部渲染器（Office / LibreOffice / WPS）探测结果；模板模式下 PNG 导出依赖它。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RendererStatus {
+    /// 尚未探测——只在选定模板后才探测。
+    Unprobed,
+    /// 探测中。
+    Probing,
+    /// 已找到可用的渲染器。
+    Available,
+    /// 未找到任何渲染器。
+    Missing,
+}
+
+/// 输出路径的校验结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutputState {
+    /// 可以直接写入。
+    Free,
+    /// 目标已存在；生成时会自动改用该路径。
+    Taken(PathBuf),
+    /// 不可用，附带可直接展示的原因。
+    Invalid(&'static str),
+}
+
 /// 工作线程写入、前台轮询读取的进度。
 #[derive(Clone)]
 struct JobProgress(Arc<Mutex<(usize, usize)>>);
@@ -106,7 +160,6 @@ struct LoadOutcome {
     sheets: Vec<String>,
     sheet: String,
     entries: Result<Vec<WordEntry>, LoadError>,
-    diag: DiagStore,
 }
 
 /// start_generate 的后台产物。
@@ -114,14 +167,12 @@ struct GenerateOutcome {
     result: Result<(), GenerateError>,
     output: PathBuf,
     count: usize,
-    diag: DiagStore,
 }
 
 /// start_export_png 的后台产物。
 struct ExportOutcome {
     result: Result<Vec<PathBuf>, String>,
     dir: PathBuf,
-    diag: DiagStore,
 }
 
 pub struct VocabApp {
@@ -139,7 +190,19 @@ pub struct VocabApp {
     pub(crate) preview: Entity<TableState<PreviewDelegate>>,
     pub(crate) status: Status,
     pub(crate) progress: (usize, usize),
-    pub(crate) diag: DiagStore,
+    pub(crate) diag: Diag,
+    /// 数据目录布局：默认输出与日志落点的唯一来源。
+    pub(crate) layout: Layout,
+    /// 会话日志建立失败时的提示。
+    log_note: Option<String>,
+    /// 最近一次成功产物的路径；None = 尚无。
+    last_artifact: Option<PathBuf>,
+    /// 选定模板的校验状态；输出区提示与禁用逻辑共用。
+    pub(crate) template_state: TemplateState,
+    /// 上一次触发模板扫描的输入值；避免同一路径重复扫描。
+    last_template_value: String,
+    /// 外部渲染器探测结果。
+    pub(crate) renderer: RendererStatus,
     cancel: Option<Arc<AtomicBool>>,
     /// 正在跑的后台任务；丢弃即中止轮询与工作线程。
     job: Option<Task<()>>,
@@ -152,6 +215,19 @@ pub struct VocabApp {
 
 impl VocabApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_layout(window, cx, Layout::resolve())
+    }
+
+    /// 用指定的数据目录布局构造（测试与嵌入场景）。
+    pub fn with_layout(window: &mut Window, cx: &mut Context<Self>, layout: Layout) -> Self {
+        let (diag, log_note) = match diag::run_log_sink(&layout.logs_dir(), "gui") {
+            Ok(sink) => {
+                let diag = Diag::with_sinks(vec![Box::new(sink)]);
+                diag::record_session(&diag, "gui", layout.root());
+                (diag, None)
+            }
+            Err(error) => (Diag::new(), Some(format!("日志不可用: {error}"))),
+        };
         let input_file =
             cx.new(|cx| InputState::new(window, cx).placeholder("选择 Excel 或 CSV 文件"));
         let output_file = cx.new(|cx| InputState::new(window, cx).placeholder("输出 .pptx 路径"));
@@ -176,17 +252,28 @@ impl VocabApp {
 
         let mut subscriptions = Vec::new();
 
+        // Ctrl/Cmd+Enter → 生成（焦点在输入框时由 Input 的订阅处理）
+        cx.bind_keys([KeyBinding::new(
+            "secondary-enter",
+            GeneratePpt,
+            Some(APP_CONTEXT),
+        )]);
+
         // 路径输入框回车 → 打开该路径
         subscriptions.push(cx.subscribe_in(
             &input_file,
             window,
-            |this, state, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+            |this, state, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter {
+                    secondary: true, ..
+                } => this.start_generate(window, cx),
+                InputEvent::PressEnter { .. } => {
                     let path = state.read(cx).value().to_string();
                     if !path.trim().is_empty() && path != this.last_input_path {
                         this.open_input(path, window, cx);
                     }
                 }
+                _ => {}
             },
         ));
 
@@ -203,6 +290,42 @@ impl VocabApp {
             },
         ));
 
+        // CSV 编码切换 → 按新编码重新读取
+        subscriptions.push(cx.subscribe_in(
+            &encoding_select,
+            window,
+            |this, _state, event: &SelectEvent<Vec<SharedString>>, window, cx| {
+                if let SelectEvent::Confirm(Some(_)) = event {
+                    this.reload_for_encoding_change(window, cx);
+                }
+            },
+        ));
+
+        // 输出 / 模板框里的 Ctrl/Cmd+Enter → 生成；模板框变动 → 重新校验
+        subscriptions.push(cx.subscribe_in(
+            &output_file,
+            window,
+            |this, _state, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter {
+                    secondary: true, ..
+                } = event
+                {
+                    this.start_generate(window, cx);
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &template_file,
+            window,
+            |this, _state, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter {
+                    secondary: true, ..
+                } => this.start_generate(window, cx),
+                InputEvent::Change => this.refresh_template_state(window, cx),
+                _ => {}
+            },
+        ));
+
         let _watcher = Self::start_watcher(window, cx);
 
         Self {
@@ -216,7 +339,13 @@ impl VocabApp {
             preview,
             status: Status::Idle,
             progress: (0, 0),
-            diag: DiagStore::new(),
+            diag,
+            layout,
+            log_note,
+            last_artifact: None,
+            template_state: TemplateState::Unset,
+            last_template_value: String::new(),
+            renderer: RendererStatus::Unprobed,
             cancel: None,
             job: None,
             _watcher,
@@ -239,7 +368,41 @@ impl VocabApp {
         self.derive_output_path(&path, window, cx);
         self.last_input_path = path.clone();
         self.last_modified = file_modified(Path::new(&path));
+        window.set_window_title(&window_title(&path));
         self.reload(window, cx);
+    }
+
+    /// 处理拖入窗口的文件：取第一个 .xlsx / .xls / .csv 打开，其余给出提示。
+    pub fn handle_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = paths.paths().first() else {
+            return;
+        };
+        let supported = ["xlsx", "xls", "csv"].iter().any(|candidate| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(candidate))
+        });
+        if !supported {
+            self.diag.warn(
+                "gui",
+                format!("拖入的路径不是 Excel/CSV 文件: {}", path.display()),
+                None,
+            );
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    "请拖入单个 .xlsx / .xls / .csv 文件",
+                ),
+                cx,
+            );
+            return;
+        }
+        self.open_input(path.display().to_string(), window, cx);
     }
 
     pub fn pick_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -271,6 +434,8 @@ impl VocabApp {
             self.template_file.update(cx, |state, cx| {
                 state.set_value(path.display().to_string(), window, cx)
             });
+            // set_value 不触发 InputEvent::Change：显式开始模板校验。
+            self.refresh_template_state(window, cx);
             cx.notify();
         }
     }
@@ -290,12 +455,11 @@ impl VocabApp {
 
     fn derive_output_path(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {
         let path = Path::new(input);
-        let parent = path.parent().unwrap_or(Path::new("."));
         let stem = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("output");
-        let output = parent.join(format!("{stem}.pptx"));
+        let output = self.layout.ppt_file(stem);
         self.output_file.update(cx, |state, cx| {
             state.set_value(output.display().to_string(), window, cx)
         });
@@ -360,6 +524,7 @@ impl VocabApp {
         let encoding = self.selected_encoding(cx);
 
         self.status = Status::Loading;
+        self.progress = (0, 0);
         self.last_modified = file_modified(&path);
         self.preview.update(cx, |state, cx| {
             state.delegate_mut().set_loading(true);
@@ -367,10 +532,10 @@ impl VocabApp {
         });
         cx.notify();
 
+        let worker_diag = self.diag.clone();
         let worker = cx.background_spawn(async move {
-            let mut diag = DiagStore::new();
             let sheets = if mode == InputMode::Excel {
-                reader::list_sheets(&path, &mut diag).unwrap_or_default()
+                reader::list_sheets(&path, &worker_diag).unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -392,10 +557,9 @@ impl VocabApp {
                 InputMode::Csv => InputSource::Csv { path, encoding },
             };
             LoadOutcome {
-                entries: reader::load(&source, &mut diag),
+                entries: reader::load(&source, &worker_diag),
                 sheets,
                 sheet,
-                diag,
             }
         });
 
@@ -407,7 +571,6 @@ impl VocabApp {
 
     fn finish_load(&mut self, outcome: LoadOutcome, window: &mut Window, cx: &mut Context<Self>) {
         self.job = None;
-        self.merge_diag(outcome.diag);
 
         self.sheets = outcome
             .sheets
@@ -456,6 +619,14 @@ impl VocabApp {
         if entries.is_empty() {
             return;
         }
+        if let OutputState::Invalid(reason) = self.output_state(cx) {
+            window.push_notification((NotificationType::Error, reason), cx);
+            return;
+        }
+        if let TemplateState::Invalid(reason) = &self.template_state {
+            window.push_notification((NotificationType::Error, reason.clone()), cx);
+            return;
+        }
 
         // 自动重命名：输出文件已存在时追加 (1) (2) …，避免覆盖。
         let requested = PathBuf::from(self.output_path(cx));
@@ -475,23 +646,26 @@ impl VocabApp {
         let worker_progress = progress.clone();
         let worker_cancel = cancel.clone();
         let count = entries.len();
+        let worker_diag = self.diag.clone();
         let worker = cx.background_spawn(async move {
-            let mut diag = DiagStore::new();
             let record = |current: usize, total: usize| {
                 worker_progress.set(current, total);
                 !worker_cancel.load(Ordering::Relaxed)
             };
             let result = match &template {
                 Some(template) => generator::generate_from_template(
-                    &entries, template, &output, record, &mut diag,
+                    &entries,
+                    template,
+                    &output,
+                    record,
+                    &worker_diag,
                 ),
-                None => generator::generate(&entries, &output, record, &mut diag),
+                None => generator::generate(&entries, &output, record, &worker_diag),
             };
             GenerateOutcome {
                 result,
                 output,
                 count,
-                diag,
             }
         });
 
@@ -513,10 +687,10 @@ impl VocabApp {
     ) {
         self.job = None;
         self.cancel = None;
-        self.merge_diag(outcome.diag);
 
         match outcome.result {
             Ok(()) => {
+                self.last_artifact = Some(outcome.output.clone());
                 self.status = Status::Done(format!("已生成 {} 张幻灯片", outcome.count).into());
                 window.push_notification(
                     (
@@ -554,24 +728,35 @@ impl VocabApp {
         if entries.is_empty() {
             return;
         }
-        let dir = Path::new(&self.output_path(cx))
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("png_output");
+        if let TemplateState::Invalid(reason) = &self.template_state {
+            window.push_notification((NotificationType::Error, reason.clone()), cx);
+            return;
+        }
         let template = self.template_path(cx);
+        if template.is_some() && matches!(self.renderer, RendererStatus::Missing) {
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    "未检测到 Office / LibreOffice / WPS，PNG 导出不可用（生成 PPT 不受影响）",
+                ),
+                cx,
+            );
+            return;
+        }
+        let dir = self.layout.png_dir();
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.status = Status::ExportingPng;
+        self.progress = (0, 0);
         self.cancel = Some(cancel.clone());
         cx.notify();
 
+        let worker_diag = self.diag.clone();
         let worker = cx.background_spawn(async move {
-            let mut diag = DiagStore::new();
             if let Err(error) = std::fs::create_dir_all(&dir) {
                 return ExportOutcome {
                     result: Err(format!("创建输出目录失败: {error}")),
                     dir,
-                    diag,
                 };
             }
             let result = match &template {
@@ -582,33 +767,34 @@ impl VocabApp {
                         template,
                         &pptx_path,
                         |_, _| !cancel.load(Ordering::Relaxed),
-                        &mut diag,
+                        &worker_diag,
                     ) {
                         Err(error) => Err(format!("生成 PPTX 失败: {error}")),
-                        Ok(()) => match renderer::render_pptx(&pptx_path, &dir, &mut diag) {
+                        Ok(()) => match renderer::render_pptx(&pptx_path, &dir, &worker_diag) {
                             Ok(pngs) => {
-                                remove_generated_pptx(&pptx_path, &mut diag);
+                                remove_generated_pptx(&pptx_path, &worker_diag);
                                 Ok(pngs)
                             }
                             Err(renderer::RenderError::NoRenderer) => {
-                                remove_generated_pptx(&pptx_path, &mut diag);
+                                remove_generated_pptx(&pptx_path, &worker_diag);
                                 Err(renderer::RENDERER_HELP.to_string())
                             }
                             Err(error) => {
-                                remove_generated_pptx(&pptx_path, &mut diag);
+                                remove_generated_pptx(&pptx_path, &worker_diag);
                                 Err(format!("外部渲染器失败: {error}"))
                             }
                         },
                     }
                 }
-                None => png_export::export_entries_to_png_with_cancel(
+                None => png_export::export_entries_to_png(
                     &entries,
                     &dir,
                     Some(cancel.as_ref()),
+                    &worker_diag,
                 )
                 .map_err(|error| error.to_string()),
             };
-            ExportOutcome { result, dir, diag }
+            ExportOutcome { result, dir }
         });
 
         let task = Self::spawn_job(window, cx, None, worker, |this, outcome, window, cx| {
@@ -625,10 +811,10 @@ impl VocabApp {
     ) {
         self.job = None;
         self.cancel = None;
-        self.merge_diag(outcome.diag);
 
         match outcome.result {
             Ok(paths) => {
+                self.last_artifact = Some(outcome.dir.clone());
                 let message = format!("已导出 {} 张 PNG → {}", paths.len(), outcome.dir.display());
                 self.status = Status::Done(message.clone().into());
                 window.push_notification((NotificationType::Success, message), cx);
@@ -677,48 +863,233 @@ impl VocabApp {
 
     /// 导出 Excel 词汇表模板并用系统默认程序打开。
     pub fn open_excel_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path = std::env::temp_dir().join("单词表模板.xlsx");
-        let opened = template::export_template(&path).and_then(|()| {
-            open::that(&path)
-                .map_err(|error| TemplateError::IoError(std::io::Error::other(error.to_string())))
-        });
-        match opened {
-            Ok(()) => window.push_notification(
+        let path = self.layout.template_xlsx();
+        if !path.exists() {
+            if let Err(error) = template::export_template(&path) {
+                window.push_notification(
+                    (NotificationType::Error, format!("导出模板失败: {error}")),
+                    cx,
+                );
+                return;
+            }
+        }
+        reveal_path(&path, &self.diag, window, cx);
+    }
+
+    /// 打开数据目录（日志、模板与默认输出的所在地）。
+    pub fn open_data_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.layout.root().to_path_buf();
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            self.diag
+                .error("gui", format!("无法创建数据目录: {error}"), None);
+            window.push_notification(
                 (
-                    NotificationType::Success,
-                    format!("已生成 {} 并打开", path.display()),
+                    NotificationType::Error,
+                    format!("无法创建数据目录: {error}"),
                 ),
                 cx,
-            ),
-            Err(error) => window.push_notification(
-                (NotificationType::Error, format!("导出模板失败: {error}")),
-                cx,
-            ),
+            );
+            return;
         }
+        reveal_path(&root, &self.diag, window, cx);
     }
 
     /// 生成示例 PPTX 模板（含占位符）并用系统默认程序打开。
     pub fn open_example_pptx(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path = std::env::temp_dir().join("示例模板.pptx");
-        let opened = template_pptx::generate_example_pptx(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|()| open::that(&path).map_err(|error| error.to_string()));
-        match opened {
-            Ok(()) => window.push_notification(
+        let path = self.layout.template_pptx();
+        if !path.exists() {
+            if let Err(error) = template_pptx::generate_example_pptx(&path) {
+                window.push_notification(
+                    (
+                        NotificationType::Error,
+                        format!("生成示例模板失败: {error}"),
+                    ),
+                    cx,
+                );
+                return;
+            }
+        }
+        if reveal_path(&path, &self.diag, window, cx) {
+            window.push_notification(
                 (
-                    NotificationType::Success,
-                    format!("已生成 {} 并打开", path.display()),
+                    NotificationType::Info,
+                    "示例模板已打开——编辑保存后在「PPTX 模板」里选择它",
                 ),
                 cx,
-            ),
-            Err(error) => window.push_notification(
+            );
+        }
+    }
+
+    // ── 校验与提示 ──
+
+    /// 输出路径的校验结果；输出区提示与「生成」可用性共用。
+    pub fn output_state(&self, cx: &App) -> OutputState {
+        let value = self.output_path(cx);
+        let value = value.trim();
+        if value.is_empty() {
+            return OutputState::Invalid("输出路径不能为空");
+        }
+        let path = Path::new(value);
+        let is_pptx = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pptx"));
+        if !is_pptx {
+            return OutputState::Invalid("输出需要 .pptx 扩展名");
+        }
+        if path.exists() {
+            return OutputState::Taken(find_available_path(path));
+        }
+        OutputState::Free
+    }
+
+    /// 「生成 PPT」是否可用。
+    pub fn can_generate(&self, cx: &App) -> bool {
+        self.base_ready(cx) && !matches!(self.output_state(cx), OutputState::Invalid(_))
+    }
+
+    /// 「导出 PNG」是否可用；模板模式下还要求检测到外部渲染器。
+    pub fn can_export_png(&self, cx: &App) -> bool {
+        self.base_ready(cx)
+            && !(self.template_path(cx).is_some()
+                && matches!(self.renderer, RendererStatus::Missing))
+    }
+
+    /// 两个动作共同的前置条件：有数据、不忙、模板校验通过。
+    fn base_ready(&self, cx: &App) -> bool {
+        !self.status.is_busy()
+            && self.entry_count(cx) > 0
+            && !matches!(self.template_state, TemplateState::Invalid(_))
+    }
+
+    /// 最近一次成功产物的路径；状态栏与集成测试共用。
+    pub fn last_artifact(&self) -> Option<&Path> {
+        self.last_artifact.as_deref()
+    }
+
+    /// 选定模板的校验状态。
+    pub fn template_state(&self) -> &TemplateState {
+        &self.template_state
+    }
+
+    /// 预览表是否在加载中；预览区空态与加载态的切换依据。
+    pub fn preview_loading(&self, cx: &App) -> bool {
+        self.preview.read(cx).delegate().is_loading()
+    }
+
+    /// CSV 编码确认：按新编码重新读取（Excel 模式或读取中不响应）。
+    pub fn reload_for_encoding_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_mode == InputMode::Csv && !self.status.is_busy() {
+            self.reload(window, cx);
+        }
+    }
+
+    /// 模板框内容变化：为空 → 内置版式；否则后台扫描占位符。
+    pub fn refresh_template_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.template_file.read(cx).value().to_string();
+        if value == self.last_template_value {
+            return;
+        }
+        self.last_template_value = value.clone();
+
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            self.template_state = TemplateState::Unset;
+            cx.notify();
+            return;
+        }
+        let path = PathBuf::from(trimmed);
+        if !path.exists() {
+            self.template_state =
+                TemplateState::Invalid(format!("模板文件不存在：{}", path.display()));
+            cx.notify();
+            return;
+        }
+
+        self.template_state = TemplateState::Scanning;
+        cx.notify();
+        self.ensure_renderer_probe(window, cx);
+
+        let diag = self.diag.clone();
+        let worker =
+            cx.background_spawn(async move { template_reader::scan_pptx_template(&path, &diag) });
+        let scanned_value = value;
+        cx.spawn_in(window, async move |this, cx| {
+            let result = worker.await;
+            this.update_in(cx, |this, _window, cx| {
+                this.finish_template_scan(&scanned_value, result, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 模板扫描结果落地；扫描期间模板框被改动则丢弃过期结果。
+    fn finish_template_scan(
+        &mut self,
+        scanned_value: &str,
+        result: Result<template_reader::TemplateScan, TemplateError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.template_file.read(cx).value().as_ref() != scanned_value {
+            return;
+        }
+        self.template_state = match result {
+            Err(error) => TemplateState::Invalid(error.to_string()),
+            Ok(scan) if !scan.placeholders.iter().any(|name| name == "单词") => {
+                TemplateState::Invalid("模板缺少必填占位符 {{单词}}，无法生成".to_string())
+            }
+            Ok(scan) => TemplateState::Ready(scan.placeholders),
+        };
+        cx.notify();
+    }
+
+    /// 惰性探测外部渲染器：只在第一次选定模板后执行一次。
+    fn ensure_renderer_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.renderer, RendererStatus::Unprobed) {
+            return;
+        }
+        self.renderer = RendererStatus::Probing;
+        let diag = self.diag.clone();
+        let worker = cx.background_spawn(async move { renderer::detect_renderer(&diag).is_some() });
+        cx.spawn_in(window, async move |this, cx| {
+            let available = worker.await;
+            this.update_in(cx, |this, _window, cx| {
+                this.renderer = if available {
+                    RendererStatus::Available
+                } else {
+                    RendererStatus::Missing
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 打开最近产物（文件或目录）。
+    pub fn open_last_artifact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.last_artifact.clone() {
+            reveal_path(&path, &self.diag, window, cx);
+        }
+    }
+
+    /// 打开日志目录；诊断计数入口。
+    pub fn open_logs_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self.layout.logs_dir();
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            self.diag
+                .error("gui", format!("无法创建日志目录: {error}"), None);
+            window.push_notification(
                 (
                     NotificationType::Error,
-                    format!("生成示例模板失败: {error}"),
+                    format!("无法创建日志目录: {error}"),
                 ),
                 cx,
-            ),
+            );
+            return;
         }
+        reveal_path(&dir, &self.diag, window, cx);
     }
 
     // ── 后台任务管线 ──
@@ -790,31 +1161,22 @@ impl VocabApp {
         }
     }
 
-    /// 保留最近一次有事件的诊断；新任务未产出诊断时不清空已有信息。
-    fn merge_diag(&mut self, diag: DiagStore) {
-        if diag.event_count() > 0 {
-            self.diag = diag;
-        }
-    }
-
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.status.is_busy();
-        let has_entries = self.entry_count(cx) > 0;
         let dark = cx.theme().is_dark();
+        let can_generate = self.can_generate(cx);
+        let can_export_png = self.can_export_png(cx);
+        // 只有生成与 PNG 导出有取消通道；读取没有，别显示死按钮。
+        let can_cancel = matches!(self.status, Status::Generating | Status::ExportingPng);
+        let generating = matches!(self.status, Status::Generating);
+        let exporting = matches!(self.status, Status::ExportingPng);
         let (current, total) = self.progress;
         let percent = if total > 0 {
             current as f32 / total as f32 * 100.
         } else {
             0.
         };
-        // 核心把告警写进 DiagStore（例如 CSV 无效字节被替换），这里给出可见入口。
+        // 核心把告警写进会话日志（例如 CSV 无效字节被替换），这里给出可见入口。
         let diag_issues = self.diag.warnings() + self.diag.errors();
-        let diag_color = if self.diag.errors() > 0 {
-            cx.theme().danger
-        } else {
-            cx.theme().warning
-        };
-
         let (status_text, status_color) = match &self.status {
             Status::Idle => (
                 "请选择 Excel 或 CSV 文件".to_string(),
@@ -853,14 +1215,61 @@ impl VocabApp {
                             .text_color(status_color)
                             .child(status_text),
                     )
-                    .when(diag_issues > 0, |this| {
-                        this.child(div().text_sm().text_color(diag_color).child(format!(
-                            "诊断：警告 {} · 错误 {}",
-                            self.diag.warnings(),
-                            self.diag.errors()
-                        )))
+                    .when_some(self.last_artifact.clone(), |this, path| {
+                        let is_dir = path.is_dir();
+                        this.child(
+                            Button::new("open-artifact")
+                                .ghost()
+                                .small()
+                                .icon(if is_dir {
+                                    IconName::FolderOpen
+                                } else {
+                                    IconName::ExternalLink
+                                })
+                                .label(if is_dir {
+                                    "打开 PNG 目录"
+                                } else {
+                                    "打开 PPT"
+                                })
+                                .tooltip(path.display().to_string())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_last_artifact(window, cx)
+                                })),
+                        )
                     })
-                    .when(busy && total > 0, |this| {
+                    .when(diag_issues > 0, |this| {
+                        this.child(
+                            Button::new("open-logs")
+                                .ghost()
+                                .small()
+                                .icon(if self.diag.errors() > 0 {
+                                    IconName::TriangleAlert
+                                } else {
+                                    IconName::Info
+                                })
+                                .label(format!(
+                                    "诊断：警告 {} · 错误 {}",
+                                    self.diag.warnings(),
+                                    self.diag.errors()
+                                ))
+                                .tooltip("打开日志目录（最近 20 次运行的完整事件）")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_logs_dir(window, cx)
+                                })),
+                        )
+                    })
+                    .when(self.diag.write_failures() > 0, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child(format!("日志写入失败 ×{}", self.diag.write_failures())),
+                        )
+                    })
+                    .when_some(self.log_note.clone(), |this, note| {
+                        this.child(div().text_sm().text_color(cx.theme().danger).child(note))
+                    })
+                    .when(generating && total > 0, |this| {
                         this.child(
                             ProgressBar::new("job-progress")
                                 .value(percent)
@@ -868,7 +1277,11 @@ impl VocabApp {
                                 .w_40(),
                         )
                     })
-                    .when(busy, |this| {
+                    .when(exporting, |this| {
+                        // 外部渲染器不报进度：给不确定的旋转指示，避免假的百分比。
+                        this.child(Spinner::new().small().color(cx.theme().muted_foreground))
+                    })
+                    .when(can_cancel, |this| {
                         this.child(
                             Button::new("cancel-job")
                                 .ghost()
@@ -882,6 +1295,16 @@ impl VocabApp {
                 h_flex()
                     .gap_2()
                     .items_center()
+                    .child(
+                        Button::new("open-data-dir")
+                            .ghost()
+                            .icon(IconName::FolderOpen)
+                            .accessibility_label("打开数据目录")
+                            .tooltip("打开数据目录（日志、模板与默认输出）")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_data_dir(window, cx)),
+                            ),
+                    )
                     .child(
                         Button::new("theme-toggle")
                             .ghost()
@@ -901,7 +1324,10 @@ impl VocabApp {
                             .outline()
                             .label("导出 PNG")
                             .icon(IconName::GalleryVerticalEnd)
-                            .disabled(!has_entries || busy)
+                            .tooltip(
+                                "把词条导出为 PNG 图片；模板模式需要 Office / LibreOffice / WPS",
+                            )
+                            .disabled(!can_export_png)
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
                                     this.start_export_png(window, cx)
@@ -913,7 +1339,8 @@ impl VocabApp {
                             .primary()
                             .label("生成 PPT")
                             .icon(IconName::Play)
-                            .disabled(!has_entries || busy)
+                            .tooltip(format!("生成 PPT（{GENERATE_SHORTCUT}）"))
+                            .disabled(!can_generate)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.start_generate(window, cx)),
                             ),
@@ -926,6 +1353,13 @@ impl Render for VocabApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
+            .key_context(APP_CONTEXT)
+            .on_action(cx.listener(|this, _: &GeneratePpt, window, cx| {
+                this.start_generate(window, cx);
+            }))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.handle_drop(paths, window, cx);
+            }))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(file_picker::render(self, window, cx))
@@ -936,7 +1370,9 @@ impl Render for VocabApp {
 }
 
 /// 自动重命名：若文件已存在，追加 (1) (2) … 直到找到可用名。
-fn find_available_path(path: &Path) -> PathBuf {
+///
+/// 名字以 ` (n)` 结尾时先剥离旧序号，避免连续生成叠成 `words (1) (1).pptx`。
+pub fn find_available_path(path: &Path) -> PathBuf {
     if !path.exists() {
         return path.to_path_buf();
     }
@@ -944,19 +1380,36 @@ fn find_available_path(path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("output");
+    let stripped = strip_index_suffix(stem);
+    let base = if stripped.is_empty() { stem } else { stripped };
     let ext = path
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("pptx");
     let parent = path.parent().unwrap_or(Path::new("."));
     for n in 1..1000u32 {
-        let candidate = parent.join(format!("{stem} ({n}).{ext}"));
+        let candidate = parent.join(format!("{base} ({n}).{ext}"));
         if !candidate.exists() {
             return candidate;
         }
     }
     // 极端情况：回退到带进程号的文件名
-    parent.join(format!("{stem}_{}.{ext}", std::process::id()))
+    parent.join(format!("{base}_{}.{ext}", std::process::id()))
+}
+
+/// 剥离结尾的 ` (数字)`；没有该后缀时原样返回。
+fn strip_index_suffix(stem: &str) -> &str {
+    let Some(start) = stem.rfind(" (") else {
+        return stem;
+    };
+    let Some(inner) = stem[start + 2..].strip_suffix(')') else {
+        return stem;
+    };
+    if !inner.is_empty() && inner.bytes().all(|byte| byte.is_ascii_digit()) {
+        &stem[..start]
+    } else {
+        stem
+    }
 }
 
 fn file_modified(path: &Path) -> Option<SystemTime> {
@@ -968,14 +1421,47 @@ fn file_modified(path: &Path) -> Option<SystemTime> {
 /// 模板模式导出 PNG 时的中间产物，渲染结束后删除。
 ///
 /// 删除失败不中断导出，但必须留下可查询的诊断事件。
-fn remove_generated_pptx(path: &Path, diag: &mut DiagStore) {
+fn remove_generated_pptx(path: &Path, diag: &Diag) {
     if let Err(error) = std::fs::remove_file(path) {
         if error.kind() != std::io::ErrorKind::NotFound {
             diag.warn(
                 "export",
-                &format!("无法删除中间文件 {}: {error}", path.display()),
+                format!("无法删除中间文件 {}: {error}", path.display()),
                 None,
             );
+        }
+    }
+}
+
+/// 窗口标题：应用名 + 当前输入文件名。
+fn window_title(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{APP_TITLE} — {name}"))
+        .unwrap_or_else(|| APP_TITLE.to_string())
+}
+
+/// 用系统默认程序打开路径；失败时记录诊断、推送错误通知并返回 false。
+///
+/// 通知只给路径与恢复动作；启动器的原始错误（可能是一整条命令）进日志，不进 toast。
+fn reveal_path(path: &Path, diag: &Diag, window: &mut Window, cx: &mut App) -> bool {
+    match open::that(path) {
+        Ok(()) => true,
+        Err(error) => {
+            diag.error(
+                "gui",
+                format!("打开失败 {}: {error}", path.display()),
+                Some(serde_json::json!({"path": path.display().to_string()})),
+            );
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    format!("无法打开，请手动访问：{}", path.display()),
+                ),
+                cx,
+            );
+            false
         }
     }
 }

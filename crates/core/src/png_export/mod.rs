@@ -3,7 +3,7 @@ pub mod pipeline;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use crate::diag::DiagStore;
+use crate::diag::Diag;
 use crate::types::WordEntry;
 
 const PNG_W: u32 = 1920;
@@ -200,7 +200,7 @@ pub fn count_non_white_pixels(png_bytes: &[u8]) -> Result<usize, PngExportError>
 pub fn render_svg_to_png(
     svg: &str,
     font_config: &pipeline::FontConfig,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<Vec<u8>, PngExportError> {
     let mut fontdb = usvg::fontdb::Database::new();
     let font_load_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -209,7 +209,11 @@ pub fn render_svg_to_png(
     if font_load_result.is_err() {
         let msg =
             "fontdb.load_system_fonts() panicked — possibly corrupted system font".to_string();
-        diag.error("render_svg_to_png", &msg, None);
+        diag.error(
+            "render",
+            msg.clone(),
+            Some(serde_json::json!({"panic": true})),
+        );
         return Err(PngExportError::FontLoadError(msg));
     }
 
@@ -243,63 +247,59 @@ pub fn render_svg_to_png(
         .encode_png()
         .map_err(|e| PngExportError::TemplateParse(format!("PNG encode: {e}")))?;
 
-    // Post-render blank-slide detection
-    let text_count = count_text_nodes(svg);
-    let total_pixels: f64 = (PNG_W as u64 * PNG_H as u64) as f64;
-    let non_white = count_non_white_pixels(&png_bytes).unwrap_or(0);
-    let density = non_white as f64 / total_pixels;
-
-    if density < 0.00001 && text_count > 0 {
-        diag.error(
-            "render_svg_to_png",
-            &format!(
-                "slide may be blank: {:.6}% non-white pixels ({} / {})",
-                density * 100.0,
-                non_white,
-                total_pixels as u64,
-            ),
-            None,
-        );
-    } else if density < 0.0001 {
-        diag.warn(
-            "render_svg_to_png",
-            &format!(
-                "slide has very low content density: {:.6}% non-white pixels ({} / {})",
-                density * 100.0,
-                non_white,
-                total_pixels as u64,
-            ),
-            None,
-        );
-    }
-
     Ok(png_bytes)
 }
 
+/// 渲染后验证：空白 / 极低内容密度上报，附带可查询字段（slide、density_pct、reason）。
+pub fn verify_slide(diag: &Diag, slide: usize, svg: &str, png_bytes: &[u8]) {
+    let text_count = count_text_nodes(svg);
+    let total_pixels: f64 = (PNG_W as u64 * PNG_H as u64) as f64;
+    let non_white = count_non_white_pixels(png_bytes).unwrap_or(0);
+    let density = non_white as f64 / total_pixels;
+    let density_pct = density * 100.0;
+
+    if density < 0.00001 && text_count > 0 {
+        diag.error(
+            "verify",
+            format!(
+                "slide {slide} may be blank: {density_pct:.6}% non-white pixels ({non_white} / {})",
+                total_pixels as u64
+            ),
+            Some(serde_json::json!({
+                "slide": slide,
+                "reason": "blank",
+                "text_elements": text_count,
+                "non_white_pixels": non_white,
+                "density_pct": density_pct,
+            })),
+        );
+    } else if density < 0.0001 {
+        diag.warn(
+            "verify",
+            format!(
+                "slide {slide} has very low content density: {density_pct:.6}% non-white pixels ({non_white} / {})",
+                total_pixels as u64
+            ),
+            Some(serde_json::json!({
+                "slide": slide,
+                "reason": "low_density",
+                "text_elements": text_count,
+                "non_white_pixels": non_white,
+                "density_pct": density_pct,
+            })),
+        );
+    }
+}
+
+/// 将条目导出为 PNG 图片；`cancel` 置位后中断，结果只含已完成的 slide。
 pub fn export_entries_to_png(
     entries: &[WordEntry],
     output_dir: &Path,
-) -> Result<Vec<std::path::PathBuf>, PngExportError> {
-    export_entries_to_png_with_cancel(entries, output_dir, None)
-}
-
-/// Like `export_entries_to_png` but with an optional cancel flag for cooperative cancellation.
-pub fn export_entries_to_png_with_cancel(
-    entries: &[WordEntry],
-    output_dir: &Path,
     cancel: Option<&AtomicBool>,
+    diag: &Diag,
 ) -> Result<Vec<std::path::PathBuf>, PngExportError> {
-    let mut diag = DiagStore::new();
-    let font_cfg = pipeline::probe_fonts(&mut diag);
-    let result = export_slides(entries, output_dir, &font_cfg, cancel, &mut diag);
-    match diag.write_ndjson_to_file(&output_dir.join("export_diag.ndjson")) {
-        Ok(_) => eprintln!(
-            "  诊断日志: {}",
-            output_dir.join("export_diag.ndjson").display()
-        ),
-        Err(e) => eprintln!("  警告: 无法写入诊断日志: {e}"),
-    }
-    result
+    let font_cfg = pipeline::probe_fonts(diag);
+    export_slides(entries, output_dir, &font_cfg, cancel, diag)
 }
 /// Returns the path to the rendered PNG on success.
 pub fn render_one_slide(
@@ -307,12 +307,22 @@ pub fn render_one_slide(
     font_config: &pipeline::FontConfig,
     output_dir: &Path,
     index: usize,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<std::path::PathBuf, PngExportError> {
     let svg = render_slide_to_svg(entry);
     let png_bytes = render_svg_to_png(&svg, font_config, diag)?;
+    verify_slide(diag, index + 1, &svg, &png_bytes);
     let path = output_dir.join(format!("slide_{}.png", index + 1));
     std::fs::write(&path, &png_bytes)?;
+    diag.info(
+        "slide",
+        format!("slide {} rendered", index + 1),
+        Some(serde_json::json!({
+            "slide": index + 1,
+            "png_bytes": png_bytes.len(),
+            "path": path.display().to_string(),
+        })),
+    );
     Ok(path)
 }
 
@@ -321,21 +331,39 @@ fn export_slides(
     output_dir: &Path,
     font_config: &pipeline::FontConfig,
     cancel: Option<&AtomicBool>,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<Vec<std::path::PathBuf>, PngExportError> {
     std::fs::create_dir_all(output_dir)?;
+    diag.info(
+        "export",
+        format!("导出 {} 条词汇 → {}", entries.len(), output_dir.display()),
+        Some(serde_json::json!({
+            "entries": entries.len(),
+            "output_dir": output_dir.display().to_string(),
+        })),
+    );
     let mut pngs = Vec::new();
+    let mut failed = 0usize;
     for (i, entry) in entries.iter().enumerate() {
         if let Some(flag) = cancel {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                diag.warn("export", "export cancelled by user", None);
+                diag.warn(
+                    "export",
+                    "export cancelled by user",
+                    Some(serde_json::json!({"cancelled": true, "processed": i})),
+                );
                 break;
             }
         }
         match render_one_slide(entry, font_config, output_dir, i, diag) {
             Ok(path) => pngs.push(path),
             Err(e) => {
-                diag.error("export", &format!("slide {} failed: {}", i + 1, e), None);
+                failed += 1;
+                diag.error(
+                    "slide",
+                    format!("slide {} failed: {}", i + 1, e),
+                    Some(serde_json::json!({"slide": i + 1, "error": e.to_string()})),
+                );
             }
         }
     }
@@ -344,6 +372,11 @@ fn export_slides(
             "all slides failed",
         )))
     } else {
+        diag.info(
+            "export",
+            format!("导出完成: {} 张 PNG", pngs.len()),
+            Some(serde_json::json!({"exported": pngs.len(), "failed": failed})),
+        );
         Ok(pngs)
     }
 }

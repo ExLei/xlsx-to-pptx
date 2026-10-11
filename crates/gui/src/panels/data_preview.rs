@@ -1,5 +1,9 @@
 //! 预览区：虚拟滚动词汇表与空状态。
 
+use gpui_kit::component::button::Button;
+use gpui_kit::component::empty::{
+    Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
+};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
@@ -49,6 +53,10 @@ impl PreviewDelegate {
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
     }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
 }
 
 impl TableDelegate for PreviewDelegate {
@@ -96,28 +104,12 @@ impl TableDelegate for PreviewDelegate {
             .when(col_ix == 0, |this| this.font_weight(FontWeight::MEDIUM))
             .child(text)
     }
-
-    /// 空表状态说明下一步操作，而不是只留一片空白。
-    fn render_empty(
-        &mut self,
-        _: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(Icon::new(IconName::Inbox).size_8())
-            .child("选择 Excel 或 CSV 文件后在此预览词汇")
-    }
 }
 
-/// 预览区：标题行 + 数据表。
+/// 预览区：标题行 + 数据表；无数据且未在读取时给出可操作的入口。
 pub fn render(app: &VocabApp, cx: &mut Context<VocabApp>) -> impl IntoElement {
     let count = app.entry_count(cx);
+    let loading = app.preview_loading(cx);
 
     v_flex()
         .flex_1()
@@ -145,9 +137,39 @@ pub fn render(app: &VocabApp, cx: &mut Context<VocabApp>) -> impl IntoElement {
                 }),
         )
         .child(
-            div()
+            v_flex()
                 .flex_1()
                 .min_h_0()
-                .child(DataTable::new(&app.preview).stripe(true).bordered(true)),
+                .child(if count == 0 && !loading {
+                    empty_state(cx).into_any_element()
+                } else {
+                    DataTable::new(&app.preview)
+                        .stripe(true)
+                        .bordered(true)
+                        .into_any_element()
+                }),
+        )
+}
+
+/// 空态：说明下一步，给出可点的入口，并提示可以直接把文件拖进来。
+fn empty_state(cx: &mut Context<VocabApp>) -> impl IntoElement {
+    Empty::new()
+        .header(
+            EmptyHeader::new()
+                .media(
+                    EmptyMedia::new()
+                        .with_variant(EmptyMediaVariant::Icon)
+                        .child(Icon::new(IconName::Inbox)),
+                )
+                .title(EmptyTitle::new().child("还没有词汇数据"))
+                .description(
+                    EmptyDescription::new().child("选择 Excel / CSV 文件，或直接把文件拖入窗口"),
+                ),
+        )
+        .child(
+            Button::new("empty-pick-input")
+                .icon(IconName::FolderOpen)
+                .label("选择文件…")
+                .on_click(cx.listener(|this, _, window, cx| this.pick_input(window, cx))),
         )
 }

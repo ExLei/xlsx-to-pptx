@@ -1087,7 +1087,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli"
-version = "0.0.2"
+version = "0.0.5"
 dependencies = [
  "clap",
  "serde_json",
@@ -3148,12 +3148,14 @@ dependencies = [
 
 [[package]]
 name = "gui"
-version = "0.0.2"
+version = "0.0.5"
 dependencies = [
  "cli",
+ "encoding_rs",
  "gpui-kit",
  "open",
  "rfd",
+ "serde_json",
  "tempfile",
  "vocab_core",
  "winresource",
@@ -7829,9 +7831,10 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vocab_core"
-version = "0.0.2"
+version = "0.0.5"
 dependencies = [
  "calamine",
+ "chrono",
  "csv",
  "encoding_rs",
  "image",

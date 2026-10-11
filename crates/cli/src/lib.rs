@@ -2,8 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use vocab_core::diag::DiagStore;
+use vocab_core::diag::{self, Diag};
 use vocab_core::generator::{generate, generate_from_template};
+use vocab_core::paths::Layout;
 use vocab_core::png_export;
 use vocab_core::reader::{list_sheets, load};
 use vocab_core::renderer;
@@ -27,7 +28,7 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         input: PathBuf,
 
-        /// 输出 PPTX 路径 (默认与输入同目录)
+        /// 输出 PPTX 路径（缺省 → 数据目录/PPT/<输入名>.pptx）
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
 
@@ -54,9 +55,9 @@ enum Command {
         #[arg(short, long, value_name = "DIR")]
         input: PathBuf,
 
-        /// 输出目录路径
-        #[arg(short, long, value_name = "DIR", default_value = ".")]
-        output: PathBuf,
+        /// 输出目录路径（缺省 → 数据目录/PPT/）
+        #[arg(short, long, value_name = "DIR")]
+        output: Option<PathBuf>,
 
         /// Excel sheet 名称 (不指定则自动取第一个)
         #[arg(short = 'S', long, value_name = "NAME")]
@@ -77,9 +78,9 @@ enum Command {
 
     /// 生成 PPTX 示例模板 (含 {{占位符}} 供用户修改)
     TemplatePptx {
-        /// 输出示例模板文件路径
-        #[arg(short, long, value_name = "FILE", default_value = "示例模板.pptx")]
-        output: PathBuf,
+        /// 输出示例模板路径（缺省 → 数据目录/示例模板.pptx）
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 
     ExportPng {
@@ -87,7 +88,7 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         input: PathBuf,
 
-        /// 输出目录 (默认与输入同目录的 png_output)
+        /// 输出目录（缺省 → 数据目录/PNG/）
         #[arg(short, long, value_name = "DIR")]
         output: Option<PathBuf>,
 
@@ -103,18 +104,19 @@ enum Command {
         #[arg(short, long, value_name = "ENCODING", default_value = "utf-8")]
         encoding: String,
     },
+
     /// 导出词汇表 Excel 模板
     Template {
-        /// 输出模板文件路径 (默认 单词表模板.xlsx)
-        #[arg(short, long, value_name = "FILE", default_value = "单词表模板.xlsx")]
-        output: PathBuf,
+        /// 输出模板路径（缺省 → 数据目录/单词表模板.xlsx）
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 
     /// 查看导出诊断日志
     Diag {
-        /// NDJSON 诊断日志文件路径
+        /// 日志文件路径 (缺省 → 数据目录/日志/ 中最新的一个)
         #[arg(value_name = "FILE")]
-        file: PathBuf,
+        file: Option<PathBuf>,
 
         /// 显示汇总统计
         #[arg(short, long)]
@@ -142,119 +144,16 @@ enum Command {
     },
 }
 
-/// 根据扩展名和参数构建 InputSource
-fn guess_source(
-    path: &Path,
-    sheet: Option<&str>,
-    encoding: &str,
-    diag: &mut DiagStore,
-) -> Result<InputSource, String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match ext.as_str() {
-        "csv" => Ok(InputSource::Csv {
-            path: path.to_path_buf(),
-            encoding: encoding.to_string(),
-        }),
-        _ => {
-            let resolved_sheet = if let Some(s) = sheet {
-                s.to_string()
-            } else {
-                list_sheets(path, diag)
-                    .map_err(|e| format!("无法列出 sheet: {e}"))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("工作簿无 sheet: {}", path.display()))?
-            };
-            Ok(InputSource::Excel {
-                path: path.to_path_buf(),
-                sheet: resolved_sheet,
-            })
-        }
-    }
-}
-
-fn generate_one(
-    source: &InputSource,
-    output: &Path,
-    force: bool,
-    template: Option<&Path>,
-    diag: &mut DiagStore,
-) -> Result<usize, String> {
-    if force && output.exists() {
-        fs::remove_file(output).map_err(|e| format!("无法删除 {output:?}: {e}"))?;
-    }
-
-    let entries = load(source, diag).map_err(|e| e.to_string())?;
-    let total = entries.len();
-
-    if let Some(tpl) = template {
-        generate_from_template(
-            &entries,
-            tpl,
-            output,
-            |current, _total| {
-                print!("\r生成进度: {current}/{_total}");
-                true
-            },
-            diag,
-        )
-        .map_err(|e| e.to_string())?;
-    } else {
-        generate(
-            &entries,
-            output,
-            |current, _total| {
-                print!("\r生成进度: {current}/{_total}");
-                true
-            },
-            diag,
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    println!("\r完成: {} — {total} 页", output.display());
-    Ok(total)
-}
-
-/// Try external renderer first, fall back to SVG pipeline.
-/// Generate PPTX from template and render with external tool.
-/// Requires LibreOffice or WPS to be installed.
-fn export_png_via_renderer(
-    entries: &[vocab_core::types::WordEntry],
-    template_path: &Path,
-    output_dir: &Path,
-    diag: &mut DiagStore,
-) -> Result<Vec<PathBuf>, String> {
-    // Step 1: generate PPTX from template
-    fs::create_dir_all(output_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
-    let pptx_path = output_dir.join("_generated.pptx");
-    if pptx_path.exists() {
-        let _ = fs::remove_file(&pptx_path);
-    }
-    generate_from_template(entries, template_path, &pptx_path, |_, _| true, diag)
-        .map_err(|e| format!("生成 PPTX 失败: {e}"))?;
-
-    // Step 2: external renderer required for template-based export
-    match renderer::render_pptx(&pptx_path, output_dir, diag) {
-        Ok(pngs) => {
-            let _ = fs::remove_file(&pptx_path);
-            Ok(pngs)
-        }
-        Err(renderer::RenderError::NoRenderer) => {
-            let _ = fs::remove_file(&pptx_path);
-            Err(renderer::RENDERER_HELP.to_string())
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&pptx_path);
-            Err(format!(
-                "外部渲染器失败: {e}\n\n{}",
-                renderer::RENDERER_HELP
-            ))
+impl Command {
+    /// 运行前缀：日志文件名与 session 事件共用。
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Generate { .. } => "generate",
+            Command::Batch { .. } => "batch",
+            Command::TemplatePptx { .. } => "template-pptx",
+            Command::ExportPng { .. } => "export",
+            Command::Template { .. } => "template",
+            Command::Diag { .. } => "diag",
         }
     }
 }
@@ -262,8 +161,58 @@ fn export_png_via_renderer(
 /// CLI 模式入口，由 main.rs 或 GUI 入口调用
 pub fn run() -> Result<(), String> {
     let cli = Cli::parse();
-    let mut diag = DiagStore::new();
     match cli.command {
+        // 查询命令：只读，不产生日志
+        Command::Diag {
+            file,
+            summary,
+            blank_slides,
+            font_trace,
+            errors,
+            slide,
+            json,
+        } => run_diag(file, summary, blank_slides, font_trace, errors, slide, json),
+
+        command => {
+            let layout = Layout::resolve();
+            let prefix = command.name();
+            let (diag, log_path) = start_session(&layout, prefix);
+            let result = dispatch(command, &layout, &diag);
+            if let Some(path) = &log_path {
+                println!("日志: {}", path.display());
+            }
+            if diag.write_failures() > 0 {
+                let detail = diag.last_failure().unwrap_or_default();
+                eprintln!(
+                    "警告: 日志写入失败 {} 次（{detail}）",
+                    diag.write_failures()
+                );
+            }
+            result
+        }
+    }
+}
+
+/// 建立本次运行的日志：会话头行 + 文件汇 + stderr 错误镜像。
+///
+/// 日志建立失败不阻塞运行，只在 stderr 提示。
+fn start_session(layout: &Layout, prefix: &str) -> (Diag, Option<PathBuf>) {
+    match diag::run_log_sink(&layout.logs_dir(), prefix) {
+        Ok(sink) => {
+            let path = sink.path().to_path_buf();
+            let diag = Diag::with_sinks(vec![Box::new(sink), Box::new(diag::StderrSink)]);
+            diag::record_session(&diag, prefix, layout.root());
+            (diag, Some(path))
+        }
+        Err(error) => {
+            eprintln!("警告: 无法创建日志文件: {error}");
+            (Diag::new(), None)
+        }
+    }
+}
+
+fn dispatch(command: Command, layout: &Layout, diag: &Diag) -> Result<(), String> {
+    match command {
         Command::Generate {
             input,
             output,
@@ -272,16 +221,9 @@ pub fn run() -> Result<(), String> {
             encoding,
             force,
         } => {
-            let source = guess_source(&input, sheet.as_deref(), &encoding, &mut diag)?;
-            let output = output.unwrap_or_else(|| {
-                let dir = input.parent().unwrap_or(Path::new("."));
-                let stem = input
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("output");
-                dir.join(format!("{stem}.pptx"))
-            });
-            generate_one(&source, &output, force, template.as_deref(), &mut diag).map(|_| ())
+            let source = guess_source(&input, sheet.as_deref(), &encoding, diag)?;
+            let output = output.unwrap_or_else(|| layout.ppt_file(&stem_of(&input)));
+            generate_one(&source, &output, force, template.as_deref(), diag).map(|_| ())
         }
 
         Command::Batch {
@@ -292,6 +234,7 @@ pub fn run() -> Result<(), String> {
             force,
             template,
         } => {
+            let output = output.unwrap_or_else(|| layout.ppt_dir());
             if !output.exists() {
                 fs::create_dir_all(&output).map_err(|e| format!("无法创建输出目录: {e}"))?;
             }
@@ -333,7 +276,7 @@ pub fn run() -> Result<(), String> {
 
                 print!("{fname} → {} ... ", out_path.display());
 
-                let source = match guess_source(&path, sheet.as_deref(), &encoding, &mut diag) {
+                let source = match guess_source(&path, sheet.as_deref(), &encoding, diag) {
                     Ok(s) => s,
                     Err(e) => {
                         failures.push((fname.to_string(), e));
@@ -342,7 +285,7 @@ pub fn run() -> Result<(), String> {
                     }
                 };
 
-                match generate_one(&source, &out_path, force, template.as_deref(), &mut diag) {
+                match generate_one(&source, &out_path, force, template.as_deref(), diag) {
                     Ok(_) => {
                         success.push(fname.to_string());
                     }
@@ -371,11 +314,13 @@ pub fn run() -> Result<(), String> {
         }
 
         Command::TemplatePptx { output } => {
+            let output = output.unwrap_or_else(|| layout.template_pptx());
             println!("生成 PPTX 示例模板到 {} ...", output.display());
             generate_example_pptx(&output).map_err(|e| format!("生成失败: {e}"))?;
             println!("完成: {}", output.display());
             Ok(())
         }
+
         Command::ExportPng {
             input,
             output,
@@ -383,21 +328,18 @@ pub fn run() -> Result<(), String> {
             sheet,
             encoding,
         } => {
-            let output = output.unwrap_or_else(|| {
-                let dir = input.parent().unwrap_or(Path::new("."));
-                dir.join("png_output")
-            });
-            let source = guess_source(&input, sheet.as_deref(), &encoding, &mut diag)?;
-            let entries = load(&source, &mut diag).map_err(|e| e.to_string())?;
+            let output = output.unwrap_or_else(|| layout.png_dir());
+            let source = guess_source(&input, sheet.as_deref(), &encoding, diag)?;
+            let entries = load(&source, diag).map_err(|e| e.to_string())?;
             println!(
                 "导出 {} 条词汇为 PNG 到 {} ...",
                 entries.len(),
                 output.display()
             );
             let pngs = if let Some(tpl) = &template {
-                export_png_via_renderer(&entries, tpl, &output, &mut diag)?
+                export_png_via_renderer(&entries, tpl, &output, diag)?
             } else {
-                png_export::export_entries_to_png(&entries, &output)
+                png_export::export_entries_to_png(&entries, &output, None, diag)
                     .map_err(|e| format!("PNG 导出失败: {e}"))?
             };
             println!("完成: {} 张图片", pngs.len());
@@ -408,159 +350,282 @@ pub fn run() -> Result<(), String> {
         }
 
         Command::Template { output } => {
+            let output = output.unwrap_or_else(|| layout.template_xlsx());
             println!("导出模板到 {} ...", output.display());
             export_template(&output).map_err(|e| format!("导出失败: {e}"))?;
             println!("完成: {}", output.display());
             Ok(())
         }
 
-        Command::Diag {
-            file,
-            summary,
-            blank_slides,
-            font_trace,
-            errors,
-            slide,
-            json,
-        } => {
-            let content = fs::read_to_string(&file)
-                .map_err(|e| format!("无法读取诊断文件 {}: {e}", file.display()))?;
+        Command::Diag { .. } => unreachable!("diag 命令在 run() 中单独处理"),
+    }
+}
 
-            let events: Vec<serde_json::Value> = content
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                .collect();
+/// 查看诊断日志：缺省路径取数据目录里最新的日志。
+fn run_diag(
+    file: Option<PathBuf>,
+    summary: bool,
+    blank_slides: bool,
+    font_trace: bool,
+    errors: bool,
+    slide: Option<usize>,
+    json: bool,
+) -> Result<(), String> {
+    let file = match file {
+        Some(file) => file,
+        None => {
+            let layout = Layout::resolve();
+            diag::newest_log(&layout.logs_dir())
+                .ok_or_else(|| format!("未找到日志：{}", layout.logs_dir().display()))?
+        }
+    };
 
-            if summary {
-                let total = events.len();
-                let info_count = events
-                    .iter()
-                    .filter(|e| e.get("level").and_then(|v| v.as_str()) == Some("INFO"))
-                    .count();
-                let warn_count = events
-                    .iter()
-                    .filter(|e| e.get("level").and_then(|v| v.as_str()) == Some("WARN"))
-                    .count();
-                let error_count = events
-                    .iter()
-                    .filter(|e| e.get("level").and_then(|v| v.as_str()) == Some("ERROR"))
-                    .count();
+    let content = fs::read_to_string(&file)
+        .map_err(|e| format!("无法读取诊断文件 {}: {e}", file.display()))?;
 
-                println!("诊断文件: {}", file.display());
-                println!("── 汇总 ──");
-                println!("  总事件: {total}");
-                println!("  INFO:   {info_count}");
-                println!("  WARN:   {warn_count}");
-                println!("  ERROR:  {error_count}");
+    let events: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
 
-                if total > 0 {
-                    // Count by target
-                    let mut targets: std::collections::HashMap<&str, usize> =
-                        std::collections::HashMap::new();
-                    for e in &events {
-                        if let Some(t) = e.get("target").and_then(|v| v.as_str()) {
-                            *targets.entry(t).or_insert(0) += 1;
-                        }
-                    }
-                    if !targets.is_empty() {
-                        println!("── 按模块 ──");
-                        let mut sorted: Vec<_> = targets.iter().collect();
-                        sorted.sort_by(|a, b| b.1.cmp(a.1));
-                        for (target, count) in sorted {
-                            println!("  {target}: {count}");
-                        }
-                    }
+    if summary {
+        let total = events.len();
+        let info_count = count_level(&events, "INFO");
+        let warn_count = count_level(&events, "WARN");
+        let error_count = count_level(&events, "ERROR");
 
-                    // Show last 3 errors/warnings
-                    let issues: Vec<_> = events
-                        .iter()
-                        .filter(|e| {
-                            let lvl = e.get("level").and_then(|v| v.as_str()).unwrap_or("");
-                            lvl == "ERROR" || lvl == "WARN"
-                        })
-                        .collect();
-                    if !issues.is_empty() {
-                        println!("── 最近 {} 条问题 ──", issues.len().min(5));
-                        for e in issues.iter().rev().take(5) {
-                            let lvl = e.get("level").and_then(|v| v.as_str()).unwrap_or("?");
-                            let tgt = e.get("target").and_then(|v| v.as_str()).unwrap_or("?");
-                            let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("?");
-                            println!("  [{lvl}] {tgt}: {msg}");
-                        }
-                    }
+        println!("诊断文件: {}", file.display());
+        println!("── 汇总 ──");
+        println!("  总事件: {total}");
+        println!("  INFO:   {info_count}");
+        println!("  WARN:   {warn_count}");
+        println!("  ERROR:  {error_count}");
+
+        if total > 0 {
+            // Count by target
+            let mut targets: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for e in &events {
+                if let Some(t) = e.get("target").and_then(|v| v.as_str()) {
+                    *targets.entry(t).or_insert(0) += 1;
                 }
-            } else {
-                // Filter events based on flags
-                let filtered: Vec<&serde_json::Value> = if let Some(n) = slide {
-                    events
-                        .iter()
-                        .filter(|e| {
-                            let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                            let in_msg = msg.contains(&format!("slide {} ", n))
-                                || msg.contains(&format!("slide_{}", n))
-                                || msg.contains(&format!("slide {}\n", n));
-                            let in_fields = e
-                                .get("fields")
-                                .and_then(|v| v.get("slide"))
-                                .and_then(|v| v.as_u64())
-                                .map(|s| s == n as u64)
-                                .unwrap_or(false);
-                            in_msg || in_fields
-                        })
-                        .collect()
-                } else if blank_slides {
-                    events
-                        .iter()
-                        .filter(|e| {
-                            let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                            msg.contains("blank") || msg.contains("very low content density")
-                        })
-                        .collect()
-                } else if font_trace {
-                    events
-                        .iter()
-                        .filter(|e| e.get("target").and_then(|v| v.as_str()) == Some("font_probe"))
-                        .collect()
-                } else if errors {
-                    events
-                        .iter()
-                        .filter(|e| {
-                            let lvl = e.get("level").and_then(|v| v.as_str()).unwrap_or("");
-                            lvl == "ERROR" || lvl == "WARN"
-                        })
-                        .collect()
-                } else {
-                    events.iter().collect()
-                };
-
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&filtered)
-                            .map_err(|e| format!("JSON 序列化失败: {e}"))?
-                    );
-                } else {
-                    for e in &filtered {
-                        let lvl = e.get("level").and_then(|v| v.as_str()).unwrap_or("?");
-                        let ts = e.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?");
-                        let tgt = e.get("target").and_then(|v| v.as_str()).unwrap_or("?");
-                        let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("?");
-                        println!("[{lvl}] {ts} {tgt}: {msg}");
-                        if let Some(fields) = e.get("fields").and_then(|v| v.as_object()) {
-                            for (k, v) in fields {
-                                println!("  {k}: {v}");
-                            }
-                        }
-                    }
-                }
-
-                if filtered.is_empty() && !json {
-                    println!("(无匹配事件)");
+            }
+            if !targets.is_empty() {
+                println!("── 按模块 ──");
+                let mut sorted: Vec<_> = targets.iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(a.1));
+                for (target, count) in sorted {
+                    println!("  {target}: {count}");
                 }
             }
 
-            Ok(())
+            // Show last errors/warnings
+            let issues: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(level_of(e), "ERROR" | "WARN"))
+                .collect();
+            if !issues.is_empty() {
+                println!("── 最近 {} 条问题 ──", issues.len().min(5));
+                for e in issues.iter().rev().take(5) {
+                    let lvl = level_of(e);
+                    let tgt = e.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+                    let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("  [{lvl}] {tgt}: {msg}");
+                }
+            }
+        }
+    } else {
+        // Filter events based on flags (all field-driven, no message substring matching)
+        let filtered: Vec<&serde_json::Value> = if let Some(n) = slide {
+            events
+                .iter()
+                .filter(|e| field_of(e, "slide").and_then(|v| v.as_u64()) == Some(n as u64))
+                .collect()
+        } else if blank_slides {
+            events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        field_of(e, "reason").and_then(|v| v.as_str()),
+                        Some("blank") | Some("low_density")
+                    )
+                })
+                .collect()
+        } else if font_trace {
+            events
+                .iter()
+                .filter(|e| e.get("target").and_then(|v| v.as_str()) == Some("font_probe"))
+                .collect()
+        } else if errors {
+            events
+                .iter()
+                .filter(|e| matches!(level_of(e), "ERROR" | "WARN"))
+                .collect()
+        } else {
+            events.iter().collect()
+        };
+
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&filtered)
+                    .map_err(|e| format!("JSON 序列化失败: {e}"))?
+            );
+        } else {
+            for e in &filtered {
+                let lvl = level_of(e);
+                let ts = e.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?");
+                let tgt = e.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+                let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("[{lvl}] {ts} {tgt}: {msg}");
+                if let Some(fields) = e.get("fields").and_then(|v| v.as_object()) {
+                    for (k, v) in fields {
+                        println!("  {k}: {v}");
+                    }
+                }
+            }
+        }
+
+        if filtered.is_empty() && !json {
+            println!("(无匹配事件)");
+        }
+    }
+
+    Ok(())
+}
+
+fn level_of(event: &serde_json::Value) -> &str {
+    event.get("level").and_then(|v| v.as_str()).unwrap_or("?")
+}
+
+fn field_of<'a>(event: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    event.get("fields").and_then(|fields| fields.get(key))
+}
+
+fn count_level(events: &[serde_json::Value], level: &str) -> usize {
+    events.iter().filter(|e| level_of(e) == level).count()
+}
+
+/// 输入文件的文件名主干，作为默认输出名。
+fn stem_of(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("output")
+        .to_string()
+}
+
+/// 根据扩展名和参数构建 InputSource
+fn guess_source(
+    path: &Path,
+    sheet: Option<&str>,
+    encoding: &str,
+    diag: &Diag,
+) -> Result<InputSource, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "csv" => Ok(InputSource::Csv {
+            path: path.to_path_buf(),
+            encoding: encoding.to_string(),
+        }),
+        _ => {
+            let resolved_sheet = if let Some(s) = sheet {
+                s.to_string()
+            } else {
+                list_sheets(path, diag)
+                    .map_err(|e| format!("无法列出 sheet: {e}"))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("工作簿无 sheet: {}", path.display()))?
+            };
+            Ok(InputSource::Excel {
+                path: path.to_path_buf(),
+                sheet: resolved_sheet,
+            })
+        }
+    }
+}
+
+fn generate_one(
+    source: &InputSource,
+    output: &Path,
+    force: bool,
+    template: Option<&Path>,
+    diag: &Diag,
+) -> Result<usize, String> {
+    if force && output.exists() {
+        fs::remove_file(output).map_err(|e| format!("无法删除 {output:?}: {e}"))?;
+    }
+
+    let entries = load(source, diag).map_err(|e| e.to_string())?;
+    let total = entries.len();
+
+    if let Some(tpl) = template {
+        generate_from_template(
+            &entries,
+            tpl,
+            output,
+            |current, _total| {
+                print!("\r生成进度: {current}/{_total}");
+                true
+            },
+            diag,
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        generate(
+            &entries,
+            output,
+            |current, _total| {
+                print!("\r生成进度: {current}/{_total}");
+                true
+            },
+            diag,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    println!("\r完成: {} — {total} 页", output.display());
+    Ok(total)
+}
+
+/// 用用户模板生成 PPTX 并交给外部渲染器（Office / LibreOffice / WPS）导出 PNG。
+fn export_png_via_renderer(
+    entries: &[vocab_core::types::WordEntry],
+    template_path: &Path,
+    output_dir: &Path,
+    diag: &Diag,
+) -> Result<Vec<PathBuf>, String> {
+    // Step 1: generate PPTX from template
+    fs::create_dir_all(output_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
+    let pptx_path = output_dir.join("_generated.pptx");
+    if pptx_path.exists() {
+        let _ = fs::remove_file(&pptx_path);
+    }
+    generate_from_template(entries, template_path, &pptx_path, |_, _| true, diag)
+        .map_err(|e| format!("生成 PPTX 失败: {e}"))?;
+
+    // Step 2: external renderer required for template-based export
+    match renderer::render_pptx(&pptx_path, output_dir, diag) {
+        Ok(pngs) => {
+            let _ = fs::remove_file(&pptx_path);
+            Ok(pngs)
+        }
+        Err(renderer::RenderError::NoRenderer) => {
+            let _ = fs::remove_file(&pptx_path);
+            Err(renderer::RENDERER_HELP.to_string())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&pptx_path);
+            Err(format!(
+                "外部渲染器失败: {e}\n\n{}",
+                renderer::RENDERER_HELP
+            ))
         }
     }
 }

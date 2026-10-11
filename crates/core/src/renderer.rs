@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::diag::DiagStore;
+use crate::diag::Diag;
 
 /// Error from the external rendering step.
 #[derive(Debug, thiserror::Error)]
@@ -50,7 +50,7 @@ pub struct DetectedRenderer {
 /// Try to detect an available external PPTX→PNG renderer.
 ///
 /// Priority: PowerPoint → LibreOffice → WPS → (none)
-pub fn detect_renderer(diag: &mut DiagStore) -> Option<DetectedRenderer> {
+pub fn detect_renderer(diag: &Diag) -> Option<DetectedRenderer> {
     // Microsoft PowerPoint (Windows only, via COM)
     if cfg!(windows) {
         if let Some(r) = detect_powerpoint(diag) {
@@ -66,7 +66,11 @@ pub fn detect_renderer(diag: &mut DiagStore) -> Option<DetectedRenderer> {
                 kind: RendererKind::LibreOffice,
                 exe: name.to_string(),
             };
-            diag.info("renderer", &format!("detected: {} ({name})", r.name), None);
+            diag.info(
+                "renderer",
+                format!("detected: {} ({name})", r.name),
+                Some(serde_json::json!({"renderer": r.name, "exe": name})),
+            );
             return Some(r);
         }
     }
@@ -78,16 +82,24 @@ pub fn detect_renderer(diag: &mut DiagStore) -> Option<DetectedRenderer> {
             kind: RendererKind::Wps,
             exe: "wps".into(),
         };
-        diag.info("renderer", "detected: WPS Office (wps)", None);
+        diag.info(
+            "renderer",
+            "detected: WPS Office (wps)",
+            Some(serde_json::json!({"renderer": "WPS Office", "exe": "wps"})),
+        );
         return Some(r);
     }
 
-    diag.warn("renderer", "no external renderer found", None);
+    diag.warn(
+        "renderer",
+        "no external renderer found",
+        Some(serde_json::json!({"candidates": ["PowerPoint", "LibreOffice", "WPS"]})),
+    );
     None
 }
 
 /// Check if PowerPoint COM automation is available.
-fn detect_powerpoint(diag: &mut DiagStore) -> Option<DetectedRenderer> {
+fn detect_powerpoint(diag: &Diag) -> Option<DetectedRenderer> {
     // Test via PowerShell: can we create the PowerPoint COM object?
     let script = r#"try { $p = New-Object -ComObject PowerPoint.Application; $p.Quit(); Write-Output 'OK' } catch { Write-Output 'FAIL' }"#;
     let mut cmd = Command::new("powershell");
@@ -106,10 +118,18 @@ fn detect_powerpoint(diag: &mut DiagStore) -> Option<DetectedRenderer> {
             kind: RendererKind::PowerPoint,
             exe: "powershell".into(),
         };
-        diag.info("renderer", "detected: Microsoft PowerPoint (COM)", None);
+        diag.info(
+            "renderer",
+            "detected: Microsoft PowerPoint (COM)",
+            Some(serde_json::json!({"renderer": "Microsoft PowerPoint", "via": "COM"})),
+        );
         Some(r)
     } else {
-        diag.info("renderer", "PowerPoint COM not available", None);
+        diag.info(
+            "renderer",
+            "PowerPoint COM not available",
+            Some(serde_json::json!({"renderer": "PowerPoint", "available": false})),
+        );
         None
     }
 }
@@ -118,12 +138,18 @@ fn detect_powerpoint(diag: &mut DiagStore) -> Option<DetectedRenderer> {
 pub fn render_pptx(
     pptx_path: &Path,
     output_dir: &Path,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<Vec<PathBuf>, RenderError> {
     let renderer = detect_renderer(diag).ok_or(RenderError::NoRenderer)?;
 
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| RenderError::Failed(format!("create output dir: {e}")))?;
+    if let Err(error) = std::fs::create_dir_all(output_dir) {
+        diag.error(
+            "renderer",
+            format!("创建输出目录失败: {}: {error}", output_dir.display()),
+            Some(serde_json::json!({"output_dir": output_dir.display().to_string()})),
+        );
+        return Err(RenderError::Failed(format!("create output dir: {error}")));
+    }
 
     match renderer.kind {
         RendererKind::PowerPoint => render_with_powerpoint(pptx_path, output_dir, diag),
@@ -139,7 +165,7 @@ pub fn render_pptx(
 fn render_with_powerpoint(
     pptx_path: &Path,
     output_dir: &Path,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<Vec<PathBuf>, RenderError> {
     // Escape single quotes in paths for PowerShell string interpolation
     let pptx = pptx_path.to_string_lossy().replace('\'', "''");
@@ -164,7 +190,11 @@ try {{
 }}"#
     );
 
-    diag.info("renderer", "calling Microsoft PowerPoint via COM", None);
+    diag.info(
+        "renderer",
+        "calling Microsoft PowerPoint via COM",
+        Some(serde_json::json!({"tool": "powerpoint"})),
+    );
 
     let mut cmd = Command::new("powershell");
     cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
@@ -182,24 +212,48 @@ try {{
         let stderr = String::from_utf8_lossy(&output.stderr);
         diag.error(
             "renderer",
-            &format!("PowerPoint COM failed: {stderr}"),
-            None,
+            format!("PowerPoint COM failed: {stderr}"),
+            Some(serde_json::json!({"tool": "powerpoint"})),
         );
         return Err(RenderError::Failed(format!("PowerPoint: {stderr}")));
     }
 
-    // Relay non-fatal warnings from PowerShell (e.g. Visible policy block)
+    // 非致命警告（如 Visible 策略拦截）逐条转发，但有上限，防止噪声淹没日志。
+    const RELAY_LIMIT: usize = 5;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stderr.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("VISIBLE_WARN:") {
-            diag.warn("renderer", &format!("PowerPoint: {trimmed}"), None);
-        } else if !trimmed.is_empty() {
-            diag.info("renderer", &format!("PowerPoint stderr: {trimmed}"), None);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    for line in lines.iter().copied().take(RELAY_LIMIT) {
+        if line.contains("VISIBLE_WARN:") {
+            diag.warn(
+                "renderer",
+                format!("PowerPoint: {line}"),
+                Some(serde_json::json!({"source": "powershell", "stderr_line": line})),
+            );
+        } else {
+            diag.info(
+                "renderer",
+                format!("PowerShell stderr: {line}"),
+                Some(serde_json::json!({"source": "powershell", "stderr_line": line})),
+            );
         }
     }
+    if lines.len() > RELAY_LIMIT {
+        diag.info(
+            "renderer",
+            format!("PowerShell stderr 共 {} 行，其余未转发", lines.len()),
+            Some(serde_json::json!({"stderr_lines": lines.len(), "relayed": RELAY_LIMIT})),
+        );
+    }
 
-    diag.info("renderer", "PowerPoint: conversion complete", None);
+    diag.info(
+        "renderer",
+        "PowerPoint: conversion complete",
+        Some(serde_json::json!({"tool": "powerpoint"})),
+    );
 
     collect_pngs_case_insensitive(output_dir, diag)
 }
@@ -210,17 +264,21 @@ fn render_with_libreoffice(
     r: &DetectedRenderer,
     pptx_path: &Path,
     output_dir: &Path,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<Vec<PathBuf>, RenderError> {
     diag.info(
         "renderer",
-        &format!(
+        format!(
             "calling LibreOffice: {} --headless --convert-to png --outdir {} {}",
             r.exe,
             output_dir.display(),
             pptx_path.display(),
         ),
-        None,
+        Some(serde_json::json!({
+            "tool": "libreoffice",
+            "exe": r.exe,
+            "output_dir": output_dir.display().to_string(),
+        })),
     );
 
     let output = Command::new(&r.exe)
@@ -235,11 +293,19 @@ fn render_with_libreoffice(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        diag.error("renderer", &format!("LibreOffice failed: {stderr}"), None);
+        diag.error(
+            "renderer",
+            format!("LibreOffice failed: {stderr}"),
+            Some(serde_json::json!({"tool": "libreoffice"})),
+        );
         return Err(RenderError::Failed(format!("LibreOffice: {stderr}")));
     }
 
-    diag.info("renderer", "LibreOffice: conversion complete", None);
+    diag.info(
+        "renderer",
+        "LibreOffice: conversion complete",
+        Some(serde_json::json!({"tool": "libreoffice"})),
+    );
     collect_pngs(output_dir, diag)
 }
 
@@ -249,17 +315,21 @@ fn render_with_wps(
     r: &DetectedRenderer,
     pptx_path: &Path,
     output_dir: &Path,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Result<Vec<PathBuf>, RenderError> {
     diag.info(
         "renderer",
-        &format!(
+        format!(
             "calling WPS: {} --headless --convert-to png --outdir {} {}",
             r.exe,
             output_dir.display(),
             pptx_path.display(),
         ),
-        None,
+        Some(serde_json::json!({
+            "tool": "wps",
+            "exe": r.exe,
+            "output_dir": output_dir.display().to_string(),
+        })),
     );
 
     let output = Command::new(&r.exe)
@@ -274,32 +344,37 @@ fn render_with_wps(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        diag.error("renderer", &format!("WPS failed: {stderr}"), None);
+        diag.error(
+            "renderer",
+            format!("WPS failed: {stderr}"),
+            Some(serde_json::json!({"tool": "wps"})),
+        );
         return Err(RenderError::Failed(format!("WPS: {stderr}")));
     }
 
-    diag.info("renderer", "WPS: conversion complete", None);
+    diag.info(
+        "renderer",
+        "WPS: conversion complete",
+        Some(serde_json::json!({"tool": "wps"})),
+    );
     collect_pngs(output_dir, diag)
 }
 
 // ── Helpers ──
 
 /// Collect PNG paths from output dir, sorted by slide number.
-fn collect_pngs(dir: &Path, diag: &mut DiagStore) -> Result<Vec<PathBuf>, RenderError> {
+fn collect_pngs(dir: &Path, diag: &Diag) -> Result<Vec<PathBuf>, RenderError> {
     collect_pngs_impl(dir, diag, false)
 }
 
 /// Like `collect_pngs` but case-insensitive on extension (for PowerPoint .PNG output).
-fn collect_pngs_case_insensitive(
-    dir: &Path,
-    diag: &mut DiagStore,
-) -> Result<Vec<PathBuf>, RenderError> {
+fn collect_pngs_case_insensitive(dir: &Path, diag: &Diag) -> Result<Vec<PathBuf>, RenderError> {
     collect_pngs_impl(dir, diag, true)
 }
 
 fn collect_pngs_impl(
     dir: &Path,
-    diag: &mut DiagStore,
+    diag: &Diag,
     case_insensitive: bool,
 ) -> Result<Vec<PathBuf>, RenderError> {
     let mut pngs: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -320,15 +395,19 @@ fn collect_pngs_impl(
         .collect();
 
     if pngs.is_empty() {
-        diag.warn("renderer", "no PNG files found in output directory", None);
+        diag.warn(
+            "renderer",
+            "no PNG files found in output directory",
+            Some(serde_json::json!({"output_dir": dir.display().to_string()})),
+        );
         return Err(RenderError::Failed("no PNG output produced".into()));
     }
 
     pngs.sort();
     diag.info(
         "renderer",
-        &format!("collected {} PNG(s)", pngs.len()),
-        None,
+        format!("collected {} PNG(s)", pngs.len()),
+        Some(serde_json::json!({"count": pngs.len()})),
     );
     Ok(pngs)
 }

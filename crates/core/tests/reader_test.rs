@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use vocab_core::diag::DiagStore;
+use vocab_core::diag::Diag;
 use vocab_core::reader;
 use vocab_core::types::InputSource;
 
@@ -17,7 +17,7 @@ fn template_path() -> PathBuf {
 #[test]
 fn list_sheets_returns_template_sheets() {
     let path = template_path();
-    let sheets = reader::list_sheets(&path, &mut DiagStore::new()).expect("should list sheets");
+    let sheets = reader::list_sheets(&path, &Diag::new()).expect("should list sheets");
     assert!(
         sheets.iter().any(|s| s.contains("单词表")),
         "sheets 应包含 '单词表'，实际: {sheets:?}"
@@ -31,7 +31,7 @@ fn load_template_returns_5_entries() {
         path: path.clone(),
         sheet: "单词表".into(),
     };
-    let entries = reader::load(&source, &mut DiagStore::new()).expect("should load entries");
+    let entries = reader::load(&source, &Diag::new()).expect("should load entries");
     assert_eq!(entries.len(), 5, "模板应为 5 条数据，实际: {entries:?}");
 
     let first = &entries[0];
@@ -50,7 +50,7 @@ fn load_csv_returns_invalid_format() {
         path,
         encoding: "utf-8".into(),
     };
-    let result = reader::load(&source, &mut DiagStore::new());
+    let result = reader::load(&source, &Diag::new());
     assert!(result.is_err(), "非 CSV 文件应返回错误");
 }
 
@@ -69,7 +69,7 @@ fn load_csv_utf8_parses_one_row() {
         path: csv_path,
         encoding: "utf-8".into(),
     };
-    let entries = reader::load(&source, &mut DiagStore::new()).expect("should load CSV");
+    let entries = reader::load(&source, &Diag::new()).expect("should load CSV");
     assert_eq!(entries.len(), 1, "应为 1 条数据，实际: {entries:?}");
     assert_eq!(entries[0].word, "apple");
     assert_eq!(entries[0].phonetic, "/ˈæpl/");
@@ -89,7 +89,7 @@ fn load_csv_missing_columns_reports_all() {
         path: csv_path,
         encoding: "utf-8".into(),
     };
-    let result = reader::load(&source, &mut DiagStore::new());
+    let result = reader::load(&source, &Diag::new());
     assert!(result.is_err(), "缺失列应返回错误");
     let err = result.unwrap_err();
     let err_msg = format!("{err}");
@@ -120,7 +120,7 @@ fn load_csv_skips_empty_word_row() {
         path: csv_path,
         encoding: "utf-8".into(),
     };
-    let entries = reader::load(&source, &mut DiagStore::new()).expect("should load CSV");
+    let entries = reader::load(&source, &Diag::new()).expect("should load CSV");
     assert_eq!(entries.len(), 1, "空 word 行应被跳过，实际: {entries:?}");
     assert_eq!(entries[0].word, "apple");
 }

@@ -14,10 +14,12 @@ cli = { path = "../cli" }
 gpui-kit = "0.7"
 rfd = "0.15"
 open = "5"
+serde_json = "1"
 
 [dev-dependencies]
 gpui-kit = { version = "0.7", features = ["test-support"] }
 tempfile = "3"
+encoding_rs = "0.8"
 
 
 [build-dependencies]

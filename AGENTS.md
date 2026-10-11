@@ -24,7 +24,8 @@ crates/
 │   ├── src/
 │   │   ├── lib.rs           # pub mod 声明
 │   │   ├── types.rs         # WordEntry, InputSource, LoadError, GenerateError, TemplateError
-│   │   ├── diag.rs          # DiagStore — 横切诊断基础设施
+│   │   ├── diag.rs          # 诊断：Diag 句柄 + 汇（文件/内存/stderr）+ 日志滚动
+│   │   ├── paths.rs         # 数据目录解析与默认落点（程序同目录优先，回退用户数据目录）
 │   │   ├── reader.rs        # Excel(calamine) / CSV(csv+encoding_rs) 读取
 │   │   ├── generator.rs     # PPTX 生成（模板文本替换 + 用户模板模式）
 │   │   ├── template_reader.rs  # 扫描/替换 {{占位符}}
@@ -50,6 +51,8 @@ crates/
 - 组件状态归视图持有：`InputState` / `SelectState` / `TableState` 都是 `Entity`，`render` 里只构建元素。
 - 耗时操作走 `cx.background_spawn`，前台任务轮询进度后回到 `update_in` 更新状态；同时只允许一个后台任务。
 - 界面走 `cx.theme()` 语义色与 rem 尺寸助手（`p_4`、`w_40`、`text_sm`），不写死颜色与像素。
+- GUI 每次启动写一份会话日志（`日志/gui_*.log`），所有后台任务事件进同一文件；
+  状态栏提供「打开数据目录」按钮。
 - UI 集成测试放 `crates/gui/tests/`，用 `#[gpui_kit::test]` 在无头窗口里驱动真实事件。
 ```
 
@@ -78,11 +81,13 @@ cargo build --release --target x86_64-pc-windows-gnu
 cargo test -p vocab_core --test png_export_test -- --nocapture
 
 # 烟雾测试（无模板 — 内置 SVG 管线）
-cargo run --release -- export-png -i assets/template.xlsx -o /tmp/test/
-cargo run --release -- diag /tmp/test/export_*.ndjson --summary
+cargo run --release -- export-png -i assets/template.xlsx    # 缺省输出到 数据目录/PNG/
+cargo run --release -- diag --summary                        # 缺省取数据目录里最新的日志
 
 # 烟雾测试（有模板 — 需安装 Office/LibreOffice/WPS）
-cargo run --release -- export-png -i assets/template.xlsx -t assets/template.pptx -o /tmp/test2/
+cargo run --release -- template-pptx                         # 先把示例模板产出到数据目录
+cargo run --release -- export-png -i assets/template.xlsx \
+  -t "target/release/英语助记卡片生成数据/示例模板.pptx"
 ```
 
 ---
@@ -105,7 +110,7 @@ cargo run --release -- export-png -i assets/template.xlsx -t assets/template.ppt
 
 ---
 
-## 诊断系统（DiagStore）
+## 诊断系统（core::diag）
 
 ### 核心原则
 
@@ -114,89 +119,73 @@ cargo run --release -- export-png -i assets/template.xlsx -t assets/template.ppt
 ### 如何使用
 
 ```rust
-use vocab_core::diag::DiagStore;
+use vocab_core::diag::Diag;
 
-fn my_function(diag: &mut DiagStore) -> Result<(), MyError> {
+fn my_function(diag: &Diag) -> Result<(), MyError> {
     diag.info("target_name", "operation started", None);
 
     match fallible_operation() {
         Ok(result) => {
-            diag.info("target_name", &format!("success: {result}"), None);
+            diag.info(
+                "target_name",
+                format!("success: {result}"),
+                Some(serde_json::json!({"count": 1})),
+            );
             Ok(())
         }
         Err(e) => {
-            diag.error("target_name", &format!("failed: {e}"), Some(&json!({"detail": "..."}).to_string()));
+            diag.error("target_name", format!("failed: {e}"), None);
             Err(e)
         }
     }
 }
 ```
 
-### DiagStore API
+### 模型
+
+- **句柄**：`Diag` 可克隆、`&self` 记录，作为函数的最后一个参数（在 `progress` / `cancel` 之后）。
+- **汇（`DiagSink`）**：`FileSink`（NDJSON 追加 + flush）、`MemorySink`（测试回读）、`StderrSink`（ERROR 镜像）。
+- **装配在边界**：CLI 每进程一个文件汇 + stderr 镜像；GUI 每会话一个文件汇；测试用 `MemorySink`。
+
+### Diag API
 
 ```rust
-diag.info(target, message, fields_json)   // 正常流程里程碑
-diag.warn(target, message, fields_json)   // 可恢复异常
-diag.error(target, message, fields_json)  // 错误（不阻止执行）
+diag.info(target, message, fields)   // 正常流程里程碑
+diag.warn(target, message, fields)   // 可恢复异常
+diag.error(target, message, fields)  // 错误（不阻止执行）
 
-// 聚合查询
-diag.event_count()  // 总事件数
-diag.warnings()     // WARN 计数
-diag.errors()       // ERROR 计数
-diag.to_ndjson()    // 序列化为 NDJSON 字符串
-diag.write_ndjson_to_file(path)  // 写入文件
+diag.event_count()      // 总事件数
+diag.warnings()         // WARN 计数
+diag.errors()           // ERROR 计数
+diag.write_failures()   // 汇写入失败次数（日志系统自身故障）
 ```
 
-### target 命名规范
+`fields` 是 `Option<serde_json::Value>`：**可被查询/断言的事实必须进 fields**，message 只给人读。
 
-| target | 使用模块 |
-| `export` | png_export 导出生命周期 |
-| `font_probe` | 字体探测 |
-| `slide` | 单张 slide 处理 |
-| `render` | PNG 渲染 |
-| `verify` | 渲染后验证 |
-| `renderer` | 外部渲染器调用 |
-| `reader` | 文件读取 |
-| `generator` | PPTX 生成 |
-| `template` | 模板解析 |
-| `cli` | CLI 命令 |
-| `gui` | GUI 操作 |
+### 日志落点与滚动
 
-### 添加新 target
-
-1. 在 `diag.rs` 不需要注册 — target 是自由字符串
-2. 在 `docs/diagnostics.md` 的 target 表中添加说明
-3. 确保 `fields` 使用一致的键名（参考已有模式）
-
-### NDJSON 写入规则
-
-```rust
-// ✓ 正确：失败不阻塞
-match diag.write_ndjson_to_file(&path) {
-    Ok(_) => eprintln!("  诊断日志: {}", path.display()),
-    Err(e) => eprintln!("  警告: 无法写入诊断日志: {e}"),
-}
-
-// ✗ 错误：静默丢弃
-let _ = diag.write_ndjson_to_file(&path);
-```
+- 数据目录：`<程序目录>/英语助记卡片生成数据/`（不可写时回退用户数据目录），
+  唯一实现是 `vocab_core::paths::Layout`；布局与回退规则见 `docs/diagnostics.md`。
+- 每次运行一份日志：`日志/<命令>_YYYYMMDD_HHMMSS.log`，实时逐事件追加，
+  日志目录保留最新 20 个文件。
+- 每个日志首行是 session 事件（版本、命令、参数、数据目录、exe、OS）。
 
 ### 查询诊断
 
 ```bash
-# Agent 用 diag 子命令（零学习成本）
-英语助记卡片生成 diag export_diag.ndjson --summary
-英语助记卡片生成 diag export_diag.ndjson --blank-slides
-英语助记卡片生成 diag export_diag.ndjson --font-trace
-英语助记卡片生成 diag export_diag.ndjson --errors
-英语助记卡片生成 diag export_diag.ndjson --slide 3
-英语助记卡片生成 diag export_diag.ndjson --json --blank-slides  # 脚本消费
+# Agent 用 diag 子命令（零学习成本；FILE 缺省 → 数据目录最新日志）
+英语助记卡片生成 diag --summary
+英语助记卡片生成 diag --blank-slides
+英语助记卡片生成 diag --font-trace
+英语助记卡片生成 diag --errors
+英语助记卡片生成 diag --slide 3
+英语助记卡片生成 diag --json --errors          # 脚本消费
 
 # 人类/高级用 jq
-grep '"ERROR"' export_diag.ndjson | jq .
-grep '"font_probe"' export_diag.ndjson | grep '"selected":true' | jq .
+jq -c 'select(.level=="ERROR")' 英语助记卡片生成数据/日志/*.log
+```
 
----
+target 表、字段清单与排障对照：`docs/diagnostics.md`。
 
 ## 错误处理规则
 
@@ -213,7 +202,7 @@ eprintln!("error: {e}");  // 不可查询
 match fallible_operation() {
     Ok(v) => v,
     Err(e) => {
-        diag.error("module", &format!("context: {e}"), None);
+        diag.error("module", format!("context: {e}"), None);
         return Err(e.into());
     }
 }
@@ -222,7 +211,7 @@ match fallible_operation() {
 match fallible_operation() {
     Ok(v) => v,
     Err(e) => {
-        diag.warn("module", &format!("degraded: {e}"), None);
+        diag.warn("module", format!("degraded: {e}"), None);
         default_value
     }
 }
@@ -253,27 +242,19 @@ match result {
 
 ### 函数签名风格
 
-- `diag: &mut DiagStore` → 最后一个参数（在 `progress` / `cancel` 之后）
-- 取消标志：`cancel: Option<&AtomicBool>` → 可选，向后兼容
+- `diag: &Diag` → 最后一个参数（在 `progress` / `cancel` 之后）
+- 取消标志：`cancel: Option<&AtomicBool>` → 可选
 - 进度回调：保持现有 `impl Fn(usize, usize) -> bool` 模式
 
-### 公共 API 稳定性
+### 公共 API 变更
 
-现有公共 API 签名不可变。内部重构时：
-
-```rust
-// 旧签名保持不变
-pub fn export_entries_to_png(entries, output_dir) -> Result<Vec<PathBuf>, PngExportError>
-
-// 新签名作为独立函数添加
-pub fn export_entries_to_png_with_cancel(entries, output_dir, cancel, diag) -> Result<Vec<PathBuf>, PngExportError>
-```
+跨 crate 的公共 API 允许破坏性变更，但必须在**同一次改动内**完成全部迁移：
+更新所有调用点、测试与文档，不留兼容别名、旧签名副本或废弃路径。
 
 ### 移除死代码
 
-死代码会分散注意力并增加维护负担。以下已清理：
-- 模板 PNG 渲染的 SVG 解析管线（`parse_slide_xml`、`SpState`、`collect_attrs` 等）
-- 对外 API 保持稳定（`export_entries_to_png_with_cancel` 等）
+死代码会分散注意力并增加维护负担。重构时同步删除过时注释、别名与废弃路径，
+不留兼容 shim。
 
 ### 外部渲染器
 
@@ -286,9 +267,12 @@ pub fn export_entries_to_png_with_cancel(entries, output_dir, cancel, diag) -> R
 
 ### 允许新增
 
-- `tracing` + `tracing-subscriber`（结构化日志）
-- `serde` + `serde_json`（NDJSON 序列化，tracing 传递依赖）
+- `chrono`（本地时区时间戳；`vocab_core` 直接依赖，features = ["clock"]）
+- `serde` + `serde_json`（NDJSON 序列化）
 - `ttf-parser`（直接依赖，复用已编译 — 字形覆盖检测）
+
+结构化日志由自研 `vocab_core::diag`（事件 + 汇）承担，不引入 `tracing`；
+除非将来真的需要 span 级追踪。
 
 ### 禁止新增
 
@@ -319,7 +303,7 @@ pub fn export_entries_to_png_with_cancel(entries, output_dir, cancel, diag) -> R
 - 设计规格：`docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`
 - 实现计划：`docs/superpowers/plans/YYYY-MM-DD-<topic>.md`
 - 诊断指南：`docs/diagnostics.md`
-- NDJSON 日志：`<输出目录>/export_diag.ndjson`
+- 日志：`<数据目录>/日志/<命令>_YYYYMMDD_HHMMSS.log`（保留最新 20 个）
 
 ---
 

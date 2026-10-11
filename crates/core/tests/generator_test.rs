@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use tempfile::tempdir;
-use vocab_core::diag::DiagStore;
+use vocab_core::diag::Diag;
 use vocab_core::generator;
 use vocab_core::types::{GenerateError, WordEntry};
 
@@ -30,7 +30,7 @@ fn generate_empty_entries_errors() {
             call_count.set(call_count.get() + 1);
             true
         },
-        &mut DiagStore::new(),
+        &Diag::new(),
     );
     assert!(matches!(result, Err(GenerateError::NoEntries)));
     assert_eq!(
@@ -53,7 +53,7 @@ fn generate_one_slide_creates_pptx() {
             call_count.set(call_count.get() + 1);
             true
         },
-        &mut DiagStore::new(),
+        &Diag::new(),
     );
     assert!(result.is_ok(), "generate should succeed: {result:?}");
     assert!(output.exists(), "output file should exist");
@@ -86,7 +86,7 @@ fn generate_calls_progress_correctly() {
             calls.set(v);
             true
         },
-        &mut DiagStore::new(),
+        &Diag::new(),
     );
     assert!(result.is_ok(), "generate should succeed: {result:?}");
 
@@ -112,7 +112,7 @@ fn generate_cancel_stops_early() {
             call_count.set(call_count.get() + 1);
             false // cancel immediately
         },
-        &mut DiagStore::new(),
+        &Diag::new(),
     );
     assert!(matches!(result, Err(GenerateError::Cancelled)));
     assert_eq!(
@@ -131,12 +131,7 @@ fn generate_file_exists_error() {
     assert!(output.exists());
 
     let entries = vec![make_entry("test")];
-    let result = generator::generate(
-        &entries,
-        &output,
-        |_, _| true,
-        &mut DiagStore::new(),
-    );
+    let result = generator::generate(&entries, &output, |_, _| true, &Diag::new());
     match result {
         Err(GenerateError::FileExists(path)) => {
             assert!(

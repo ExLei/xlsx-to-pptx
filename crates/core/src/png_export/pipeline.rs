@@ -1,4 +1,4 @@
-use crate::diag::DiagStore;
+use crate::diag::Diag;
 
 /// Font configuration: identifies an available system font.
 /// CSS font-family stack string with fallback chains resolved.
@@ -13,7 +13,7 @@ pub struct FontConfig {
 ///
 /// Checks prioritized candidate lists for Latin, CJK, and Emoji fonts.
 /// Emits diagnostic events for every candidate checked and the final selection.
-pub fn probe_fonts(diag: &mut DiagStore) -> FontConfig {
+pub fn probe_fonts(diag: &Diag) -> FontConfig {
     let mut db = usvg::fontdb::Database::new();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         db.load_system_fonts();
@@ -22,7 +22,7 @@ pub fn probe_fonts(diag: &mut DiagStore) -> FontConfig {
         diag.error(
             "font_probe",
             "fontdb.load_system_fonts() panicked — possible corrupt system font",
-            None,
+            Some(serde_json::json!({"panic": true})),
         );
         return FontConfig {
             font_stack: "sans-serif".into(),
@@ -34,8 +34,8 @@ pub fn probe_fonts(diag: &mut DiagStore) -> FontConfig {
     let face_count = db.faces().count();
     diag.info(
         "font_probe",
-        &format!("scanned {face_count} font faces"),
-        None,
+        format!("scanned {face_count} font faces"),
+        Some(serde_json::json!({"faces": face_count})),
     );
 
     let latin_chain = ["Segoe UI", "Helvetica", "Arial", "DejaVu Sans"];
@@ -64,7 +64,11 @@ pub fn probe_fonts(diag: &mut DiagStore) -> FontConfig {
     parts.push("sans-serif");
 
     let font_stack = parts.join(", ");
-    diag.info("font_probe", &format!("font_stack: {font_stack}"), None);
+    diag.info(
+        "font_probe",
+        format!("font_stack: {font_stack}"),
+        Some(serde_json::json!({"font_stack": font_stack})),
+    );
 
     if let Some(ref latin) = best_latin {
         db.set_sans_serif_family(latin);
@@ -82,7 +86,7 @@ fn find_first(
     db: &usvg::fontdb::Database,
     candidates: &[&str],
     chain: &str,
-    diag: &mut DiagStore,
+    diag: &Diag,
 ) -> Option<String> {
     for (i, name) in candidates.iter().enumerate() {
         let count = db
@@ -92,24 +96,26 @@ fn find_first(
         if count > 0 {
             diag.info(
                 "font_probe",
-                &format!("{chain}: selected \"{name}\" ({count} faces, order={i})"),
-                None,
+                format!("{chain}: selected \"{name}\" ({count} faces, order={i})"),
+                Some(serde_json::json!({"chain": chain, "candidate": name, "faces": count, "order": i, "selected": true})),
             );
             return Some(name.to_string());
         }
         diag.info(
             "font_probe",
-            &format!("{chain}: \"{name}\" not found (order={i})"),
-            None,
+            format!("{chain}: \"{name}\" not found (order={i})"),
+            Some(
+                serde_json::json!({"chain": chain, "candidate": name, "found": false, "order": i}),
+            ),
         );
     }
     diag.warn(
         "font_probe",
-        &format!(
+        format!(
             "{chain}: all {count} candidates missing",
             count = candidates.len()
         ),
-        None,
+        Some(serde_json::json!({"chain": chain, "candidates": candidates.len()})),
     );
     None
 }

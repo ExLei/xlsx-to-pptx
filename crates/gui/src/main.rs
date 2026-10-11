@@ -19,9 +19,7 @@ mod win_console {
 
 use gpui_kit::component::Theme;
 use gpui_kit::*;
-use gui::app;
-
-const APP_TITLE: &str = "英语助记卡片生成";
+use gui::{app, APP_TITLE};
 
 fn main() {
     // 有命令行参数 → CLI 模式；无参数 → GUI 模式

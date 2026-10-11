@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use tempfile::tempdir;
-use vocab_core::diag::DiagStore;
+use vocab_core::diag::Diag;
 use vocab_core::generator;
 use vocab_core::types::{GenerateError, WordEntry};
 use zip::{write::SimpleFileOptions, ZipWriter};
@@ -248,7 +248,8 @@ fn gen_from_template_one_entry_creates_pptx() {
     let output = dir.path().join("out.pptx");
     let entries = vec![make_entry("apple")];
 
-    let result = generator::generate_from_template(&entries, &template, &output, |_, _| true, &mut DiagStore::new());
+    let result =
+        generator::generate_from_template(&entries, &template, &output, |_, _| true, &Diag::new());
     assert!(
         result.is_ok(),
         "generate_from_template should succeed: {result:?}"
@@ -283,7 +284,8 @@ fn gen_from_template_empty_entries_errors() {
 
     let output = dir.path().join("empty.pptx");
 
-    let result = generator::generate_from_template(&[], &template, &output, |_, _| true, &mut DiagStore::new());
+    let result =
+        generator::generate_from_template(&[], &template, &output, |_, _| true, &Diag::new());
     assert!(matches!(result, Err(GenerateError::NoEntries)));
 }
 
@@ -297,12 +299,18 @@ fn gen_from_template_progress_called() {
     let entries = vec![make_entry("one"), make_entry("two")];
 
     let call_count = Cell::new(0);
-    let result = generator::generate_from_template(&entries, &template, &output, |c, t| {
-        call_count.set(1); // just mark called
-        assert_eq!(t, 2, "total should be 2");
-        assert!(c >= 1 && c <= 2);
-        true
-    }, &mut DiagStore::new());
+    let result = generator::generate_from_template(
+        &entries,
+        &template,
+        &output,
+        |c, t| {
+            call_count.set(1); // just mark called
+            assert_eq!(t, 2, "total should be 2");
+            assert!(c >= 1 && c <= 2);
+            true
+        },
+        &Diag::new(),
+    );
     assert!(result.is_ok(), "generate should succeed: {result:?}");
 }
 
@@ -315,7 +323,8 @@ fn gen_from_template_cancel_stops() {
     let output = dir.path().join("cancelled.pptx");
     let entries = vec![make_entry("one")];
 
-    let result = generator::generate_from_template(&entries, &template, &output, |_, _| false, &mut DiagStore::new());
+    let result =
+        generator::generate_from_template(&entries, &template, &output, |_, _| false, &Diag::new());
     assert!(matches!(result, Err(GenerateError::Cancelled)));
 }
 
@@ -329,7 +338,8 @@ fn gen_from_template_file_exists_errors() {
     fs::write(&output, b"existing").unwrap();
 
     let entries = vec![make_entry("test")];
-    let result = generator::generate_from_template(&entries, &template, &output, |_, _| true, &mut DiagStore::new());
+    let result =
+        generator::generate_from_template(&entries, &template, &output, |_, _| true, &Diag::new());
     assert!(matches!(result, Err(GenerateError::FileExists(_))));
 }
 
@@ -379,6 +389,7 @@ fn gen_from_template_missing_word_placeholder_errors() {
 
     let output = dir.path().join("out.pptx");
     let entries = vec![make_entry("test")];
-    let result = generator::generate_from_template(&entries, &template, &output, |_, _| true, &mut DiagStore::new());
+    let result =
+        generator::generate_from_template(&entries, &template, &output, |_, _| true, &Diag::new());
     assert!(result.is_err(), "should error when {{单词}} is missing");
 }

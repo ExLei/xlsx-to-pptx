@@ -5,7 +5,7 @@ use std::path::Path;
 
 use calamine::{open_workbook, Data, Reader, Xlsx};
 
-use crate::diag::DiagStore;
+use crate::diag::Diag;
 use crate::types::{InputSource, LoadError, WordEntry};
 
 /// 6 必填列: (Excel 表头 → 内部 key)
@@ -19,26 +19,26 @@ const REQUIRED_COLUMNS: &[(&str, &str)] = &[
 ];
 
 /// 返回工作簿中所有 sheet 名
-pub fn list_sheets(path: &Path, diag: &mut DiagStore) -> Result<Vec<String>, LoadError> {
+pub fn list_sheets(path: &Path, diag: &Diag) -> Result<Vec<String>, LoadError> {
     let workbook: Xlsx<_> =
         open_workbook(path).map_err(|e| LoadError::IoError(std::io::Error::other(e)))?;
     let names = workbook.sheet_names().to_vec();
     diag.info(
         "reader",
-        &format!("发现 {} 个工作表: {:?}", names.len(), names),
-        None,
+        format!("发现 {} 个工作表: {:?}", names.len(), names),
+        Some(serde_json::json!({"sheet_count": names.len(), "sheets": names})),
     );
     Ok(names)
 }
 
 /// 根据 InputSource 读取并解析词汇数据
-pub fn load(source: &InputSource, diag: &mut DiagStore) -> Result<Vec<WordEntry>, LoadError> {
+pub fn load(source: &InputSource, diag: &Diag) -> Result<Vec<WordEntry>, LoadError> {
     match source {
         InputSource::Excel { path, sheet } => load_excel(path, sheet, diag),
         InputSource::Csv { path, encoding } => load_csv(path, encoding, diag),
     }
 }
-fn load_excel(path: &Path, sheet: &str, diag: &mut DiagStore) -> Result<Vec<WordEntry>, LoadError> {
+fn load_excel(path: &Path, sheet: &str, diag: &Diag) -> Result<Vec<WordEntry>, LoadError> {
     let mut workbook: Xlsx<_> =
         open_workbook(path).map_err(|e| LoadError::IoError(std::io::Error::other(e)))?;
 
@@ -60,8 +60,8 @@ fn load_excel(path: &Path, sheet: &str, diag: &mut DiagStore) -> Result<Vec<Word
         if entry.should_skip() {
             diag.warn(
                 "reader",
-                &format!("第 {} 行 word 为空，已跳过", row_idx + 2),
-                None,
+                format!("第 {} 行 word 为空，已跳过", row_idx + 2),
+                Some(serde_json::json!({"row": row_idx + 2})),
             );
             continue;
         }
@@ -85,11 +85,7 @@ fn validate_columns(col_map: &HashMap<String, usize>) -> Result<(), LoadError> {
 }
 
 /// 读取 CSV 文件，支持多编码（UTF-8、GBK、GB2312、GB18030）
-fn load_csv(
-    path: &Path,
-    encoding: &str,
-    diag: &mut DiagStore,
-) -> Result<Vec<WordEntry>, LoadError> {
+fn load_csv(path: &Path, encoding: &str, diag: &Diag) -> Result<Vec<WordEntry>, LoadError> {
     let raw = fs::read(path)?;
 
     let text = if encoding.eq_ignore_ascii_case("utf-8") {
@@ -102,8 +98,8 @@ fn load_csv(
         if had_errors {
             diag.warn(
                 "reader",
-                &format!("编码 '{encoding}' 解码时遇到无效字节，已替换"),
-                None,
+                format!("编码 '{encoding}' 解码时遇到无效字节，已替换"),
+                Some(serde_json::json!({"encoding": encoding})),
             );
         }
         cow.into_owned()
@@ -145,8 +141,8 @@ fn load_csv(
         if entry.should_skip() {
             diag.warn(
                 "reader",
-                &format!("第 {} 行 word 为空，已跳过", row_idx + 2),
-                None,
+                format!("第 {} 行 word 为空，已跳过", row_idx + 2),
+                Some(serde_json::json!({"row": row_idx + 2})),
             );
             continue;
         }

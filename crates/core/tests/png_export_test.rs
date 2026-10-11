@@ -110,8 +110,8 @@ fn make_test_svg() -> String {
 
 #[test]
 fn probe_fonts_returns_non_empty() {
-    let mut diag = vocab_core::diag::DiagStore::new();
-    let cfg = vocab_core::png_export::pipeline::probe_fonts(&mut diag);
+    let diag = vocab_core::diag::Diag::new();
+    let cfg = vocab_core::png_export::pipeline::probe_fonts(&diag);
     assert!(
         !cfg.font_stack.is_empty(),
         "probe_fonts must return a font_stack"
@@ -120,17 +120,30 @@ fn probe_fonts_returns_non_empty() {
 
 #[test]
 fn probe_fonts_emits_diag_events() {
-    let mut diag = vocab_core::diag::DiagStore::new();
-    let _cfg = vocab_core::png_export::pipeline::probe_fonts(&mut diag);
+    let sink = vocab_core::diag::MemorySink::new();
+    let diag = vocab_core::diag::Diag::with_sinks(vec![Box::new(sink.clone())]);
+    let _cfg = vocab_core::png_export::pipeline::probe_fonts(&diag);
     assert!(diag.event_count() > 0, "probe_fonts must emit diag events");
+
+    let events = sink.events();
+    assert!(
+        events.iter().all(|event| event.target == "font_probe"),
+        "probe_fonts 的事件必须带 font_probe target"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.fields.as_ref().and_then(|f| f.get("chain")).is_some()),
+        "font 链事件必须带结构化 fields"
+    );
 }
 
 // probe_fonts now returns a single FontConfig directly (no first_available needed)
 
 #[test]
 fn probe_fonts_returns_valid_config() {
-    let mut diag = vocab_core::diag::DiagStore::new();
-    let cfg = vocab_core::png_export::pipeline::probe_fonts(&mut diag);
+    let diag = vocab_core::diag::Diag::new();
+    let cfg = vocab_core::png_export::pipeline::probe_fonts(&diag);
     assert!(!cfg.font_stack.is_empty());
     assert!(cfg.font_stack.contains("sans-serif"));
 }
@@ -198,16 +211,16 @@ fn count_non_white_pixels_counts_colored_pixels() {
 // ── Updated render_svg_to_png tests with FontConfig ──
 
 fn make_test_font_config() -> vocab_core::png_export::pipeline::FontConfig {
-    let mut diag = vocab_core::diag::DiagStore::new();
-    vocab_core::png_export::pipeline::probe_fonts(&mut diag)
+    let diag = vocab_core::diag::Diag::new();
+    vocab_core::png_export::pipeline::probe_fonts(&diag)
 }
 
 #[test]
 fn render_svg_to_png_produces_valid_png_bytes() {
     let svg = make_test_svg();
     let font_cfg = make_test_font_config();
-    let mut diag = vocab_core::diag::DiagStore::new();
-    let png_bytes = vocab_core::png_export::render_svg_to_png(&svg, &font_cfg, &mut diag)
+    let diag = vocab_core::diag::Diag::new();
+    let png_bytes = vocab_core::png_export::render_svg_to_png(&svg, &font_cfg, &diag)
         .expect("should render SVG to PNG");
 
     assert_eq!(
@@ -226,8 +239,8 @@ fn render_svg_to_png_produces_valid_png_bytes() {
 fn render_svg_to_png_has_correct_dimensions() {
     let svg = make_test_svg();
     let font_cfg = make_test_font_config();
-    let mut diag = vocab_core::diag::DiagStore::new();
-    let png_bytes = vocab_core::png_export::render_svg_to_png(&svg, &font_cfg, &mut diag).unwrap();
+    let diag = vocab_core::diag::Diag::new();
+    let png_bytes = vocab_core::png_export::render_svg_to_png(&svg, &font_cfg, &diag).unwrap();
 
     let img = image::load_from_memory(&png_bytes).expect("should decode PNG");
     assert_eq!(img.width(), 1920, "PNG width should be 1920");
@@ -243,9 +256,10 @@ fn blank_slide_detection_density_below_001_pct_with_text_emits_error() {
   <text x="80" y="180" font-family="sans-serif" font-size="72" fill="#ffffff">invisible text</text>
 </svg>"##;
     let font_cfg = make_test_font_config();
-    let mut diag = vocab_core::diag::DiagStore::new();
-    let png = vocab_core::png_export::render_svg_to_png(&svg, &font_cfg, &mut diag)
-        .expect("should render");
+    let sink = vocab_core::diag::MemorySink::new();
+    let diag = vocab_core::diag::Diag::with_sinks(vec![Box::new(sink.clone())]);
+    let png =
+        vocab_core::png_export::render_svg_to_png(&svg, &font_cfg, &diag).expect("should render");
 
     let text_nodes = vocab_core::png_export::count_text_nodes(&svg);
     let non_white = vocab_core::png_export::count_non_white_pixels(&png).unwrap();
@@ -254,11 +268,17 @@ fn blank_slide_detection_density_below_001_pct_with_text_emits_error() {
         non_white < 100,
         "near-zero density: {non_white} non-white pixels"
     );
-    let diag_events = diag.to_ndjson();
-    assert!(
-        diag_events.contains("slide may be blank"),
-        "diag should contain blank-slide warning, got:\n{diag_events}"
-    );
+
+    vocab_core::png_export::verify_slide(&diag, 3, &svg, &png);
+
+    let events = sink.events();
+    let blank = events
+        .iter()
+        .find(|event| event.reason() == Some("blank"))
+        .expect("应上报 reason=blank 的空白 slide");
+    assert_eq!(blank.target, "verify");
+    assert_eq!(blank.slide_index(), Some(3));
+    assert_eq!(blank.level, vocab_core::diag::DiagLevel::Error);
 }
 
 // ── 默认版式：与 template-pptx 示例模板同尺度（1920×1080 画布） ──
@@ -310,5 +330,49 @@ fn svg_default_layout_matches_example_template_geometry() {
     assert!(
         svg.contains(r#"font-size="40""#),
         "标签行应为 24pt → 40px, got: {svg}"
+    );
+}
+
+// ── 导出事件流：export 生命周期 + 逐 slide 事件（fields 驱动查询） ──
+
+#[test]
+fn export_emits_lifecycle_and_per_slide_events() {
+    use vocab_core::diag::{Diag, MemorySink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let entry = WordEntry {
+        word: "apple".into(),
+        phonetic: "/ˈæpl/".into(),
+        morphology: String::new(),
+        example: String::new(),
+        example_definition: String::new(),
+        definition: "苹果".into(),
+    };
+
+    let sink = MemorySink::new();
+    let diag = Diag::with_sinks(vec![Box::new(sink.clone())]);
+    let pngs = png_export::export_entries_to_png(&[entry], dir.path(), None, &diag)
+        .expect("export should succeed");
+    assert_eq!(pngs.len(), 1);
+
+    let events = sink.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.target == "export" && event.message.contains("导出完成")),
+        "应有一条 export 完成事件: {:?}",
+        events
+            .iter()
+            .map(|event| (&event.target, &event.message))
+            .collect::<Vec<_>>()
+    );
+
+    let slide = events
+        .iter()
+        .find(|event| event.target == "slide" && event.slide_index() == Some(1))
+        .expect("应有一条 fields.slide == 1 的逐 slide 事件");
+    assert!(
+        slide.fields.as_ref().unwrap().get("path").is_some(),
+        "逐 slide 事件应带 path 字段"
     );
 }

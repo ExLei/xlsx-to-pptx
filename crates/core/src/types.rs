@@ -67,6 +67,8 @@ pub enum TemplateError {
     IoError(#[from] std::io::Error),
     #[error("内置模板损坏")]
     CorruptEmbedded,
+    #[error("模板文件损坏或不是有效的 PPTX: {0}")]
+    Corrupt(String),
     #[error("模板缺少必填占位符: {{单词}}")]
     MissingPlaceholder,
 }
