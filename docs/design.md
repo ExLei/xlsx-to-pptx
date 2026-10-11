@@ -402,7 +402,7 @@ AppState
 │   Failed { error: OpError, retry: RetryAction }
 └─ document: Document
     source: Option<PathBuf> · sheet: Option<String> · sheets: Vec<SheetInfo>
-    encoding: String · entries: Vec<WordEntry>
+    encoding: String · entries: Vec<WordEntry> · template_path: Option<PathBuf>
     template: TemplateField = Unset | Checking | Ready{slides, fields} | Invalid{reason}
     output: OutputField   = Auto | Taken{path} | Invalid{reason}
 └─ renderer: RendererField = Probing | Available{name} | Missing
