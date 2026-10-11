@@ -1,0 +1,13 @@
+[package]
+name = "x2p-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "英语助记卡片生成"
+path = "src/main.rs"
+
+[dependencies]
+x2p-cli.workspace = true
+x2p-gui.workspace = true

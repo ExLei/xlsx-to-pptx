@@ -1,0 +1,19 @@
+[package]
+name = "x2p-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "x2p_gui"
+
+[dependencies]
+x2p-core.workspace = true
+gpui-kit = "0.7"
+rfd = "0.15"
+open = "5"
+serde_json.workspace = true
+
+[dev-dependencies]
+gpui-kit = { version = "0.7", features = ["test-support"] }
+tempfile = "3"
