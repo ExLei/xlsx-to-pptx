@@ -9010,6 +9010,7 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "serde_json",
+ "tempfile",
  "x2p-core",
 ]
 
