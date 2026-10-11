@@ -11,3 +11,6 @@ path = "src/main.rs"
 [dependencies]
 x2p-cli.workspace = true
 x2p-gui.workspace = true
+
+[build-dependencies]
+winresource = "0.1"
