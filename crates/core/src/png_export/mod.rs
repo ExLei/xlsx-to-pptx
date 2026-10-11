@@ -1,32 +1,13 @@
 pub mod pipeline;
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-
-use image::Rgba;
 
 use crate::diag::DiagStore;
 use crate::types::WordEntry;
 
 const PNG_W: u32 = 1920;
 const PNG_H: u32 = 1080;
-
-#[derive(Debug, Clone)]
-pub struct PlaceholderLayout {
-    pub name: String,
-    pub x: i32,
-    pub h: u32,
-    pub y: i32,
-    pub w: u32,
-    pub font_size_pt: f32,
-    pub bold: bool,
-    pub color: Rgba<u8>,
-    pub align_center: bool,
-    pub font_family: Option<String>,
-    /// Text vertical anchor: "t" (top), "ctr" (center), or "b" (bottom)
-    pub text_anchor: String,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PngExportError {
@@ -41,11 +22,6 @@ pub enum PngExportError {
     #[error("template parse: {0}")]
     TemplateParse(String),
 }
-/// 1920×1080 画布对应 16:9 幻灯片的 16in×9in = 1152pt，即 1pt = 1.667px。
-///
-/// 模板解析出的字号是磅值，写进 SVG 前必须换算成画布像素，否则整版文字会小一半。
-pub const PT_TO_PX: f32 = PNG_W as f32 / (16.0 * 72.0);
-
 /// 无模板时的内置版式槽位。
 struct DefaultSlot {
     name: &'static str,
@@ -122,14 +98,9 @@ const DEFAULT_LAYOUT: [DefaultSlot; 6] = [
 
 /// Render a single slide as an SVG string for resvg-based PNG export.
 ///
-/// Generates a 1920×1080 SVG. Fields present in `layout` use the template's
-/// coordinates (with `font_size_pt` converted to canvas pixels); the remaining
-/// fields fall back to [`DEFAULT_LAYOUT`], which mirrors the example template's
-/// geometry.
-pub fn render_slide_to_svg(
-    entry: &WordEntry,
-    layout: &HashMap<String, PlaceholderLayout>,
-) -> String {
+/// Generates a 1920×1080 SVG laid out by [`DEFAULT_LAYOUT`], which mirrors the
+/// example template's geometry. Empty fields are skipped.
+pub fn render_slide_to_svg(entry: &WordEntry) -> String {
     let mut svg = String::new();
     let w = PNG_W;
     let h = PNG_H;
@@ -156,48 +127,23 @@ pub fn render_slide_to_svg(
         if value.is_empty() {
             continue;
         }
-        match layout.get(name) {
-            // 模板版式：坐标与锚点来自模板，字号由磅换算成画布像素
-            Some(pl) => {
-                let font_px = pl.font_size_pt * PT_TO_PX;
-                let baseline = match pl.text_anchor.as_str() {
-                    "ctr" => pl.y as f32 + pl.h as f32 / 2. + font_px / 3.,
-                    "b" => pl.y as f32 + pl.h as f32 - 4.,
-                    _ => pl.y as f32 + font_px, // "t"（默认）
-                };
-                let font_weight = if pl.bold { "bold" } else { "normal" };
-                let color_hex =
-                    format!("#{:02x}{:02x}{:02x}", pl.color[0], pl.color[1], pl.color[2]);
-                let font_family = pl.font_family.as_deref().unwrap_or("sans-serif");
-                svg.push_str(&format!(
-                    r##"<text x="{}" y="{}" font-family="{font_family}, sans-serif" font-size="{}" font-weight="{font_weight}" fill="{color_hex}">{}</text>"##,
-                    fmt_px(pl.x as f32),
-                    fmt_px(baseline),
-                    fmt_px(font_px),
-                    xml_escape(value),
-                ));
-            }
-            // 内置版式：与示例模板同坐标
-            None => {
-                let Some(slot) = DEFAULT_LAYOUT.iter().find(|slot| slot.name == name) else {
-                    continue;
-                };
-                let text = format!("{}{value}", slot.label);
-                let anchor = if slot.centered {
-                    r#" text-anchor="middle""#
-                } else {
-                    ""
-                };
-                svg.push_str(&format!(
-                    r#"<text x="{}" y="{}"{anchor} font-family="sans-serif" font-size="{}" fill="{}">{}</text>"#,
-                    fmt_px(slot.x),
-                    fmt_px(slot.baseline),
-                    fmt_px(slot.font_px),
-                    slot.color,
-                    xml_escape(&text),
-                ));
-            }
-        }
+        let Some(slot) = DEFAULT_LAYOUT.iter().find(|slot| slot.name == name) else {
+            continue;
+        };
+        let text = format!("{}{value}", slot.label);
+        let anchor = if slot.centered {
+            r#" text-anchor="middle""#
+        } else {
+            ""
+        };
+        svg.push_str(&format!(
+            r#"<text x="{}" y="{}"{anchor} font-family="sans-serif" font-size="{}" fill="{}">{}</text>"#,
+            fmt_px(slot.x),
+            fmt_px(slot.baseline),
+            fmt_px(slot.font_px),
+            slot.color,
+            xml_escape(&text),
+        ));
     }
 
     svg.push_str("</svg>");
@@ -345,14 +291,7 @@ pub fn export_entries_to_png_with_cancel(
 ) -> Result<Vec<std::path::PathBuf>, PngExportError> {
     let mut diag = DiagStore::new();
     let font_cfg = pipeline::probe_fonts(&mut diag);
-    let result = export_with_layout(
-        entries,
-        output_dir,
-        &HashMap::new(),
-        &font_cfg,
-        cancel,
-        &mut diag,
-    );
+    let result = export_slides(entries, output_dir, &font_cfg, cancel, &mut diag);
     match diag.write_ndjson_to_file(&output_dir.join("export_diag.ndjson")) {
         Ok(_) => eprintln!(
             "  诊断日志: {}",
@@ -365,23 +304,21 @@ pub fn export_entries_to_png_with_cancel(
 /// Returns the path to the rendered PNG on success.
 pub fn render_one_slide(
     entry: &WordEntry,
-    layout: &HashMap<String, PlaceholderLayout>,
     font_config: &pipeline::FontConfig,
     output_dir: &Path,
     index: usize,
     diag: &mut DiagStore,
 ) -> Result<std::path::PathBuf, PngExportError> {
-    let svg = render_slide_to_svg(entry, layout);
+    let svg = render_slide_to_svg(entry);
     let png_bytes = render_svg_to_png(&svg, font_config, diag)?;
     let path = output_dir.join(format!("slide_{}.png", index + 1));
     std::fs::write(&path, &png_bytes)?;
     Ok(path)
 }
 
-fn export_with_layout(
+fn export_slides(
     entries: &[WordEntry],
     output_dir: &Path,
-    layout: &HashMap<String, PlaceholderLayout>,
     font_config: &pipeline::FontConfig,
     cancel: Option<&AtomicBool>,
     diag: &mut DiagStore,
@@ -395,7 +332,7 @@ fn export_with_layout(
                 break;
             }
         }
-        match render_one_slide(entry, layout, font_config, output_dir, i, diag) {
+        match render_one_slide(entry, font_config, output_dir, i, diag) {
             Ok(path) => pngs.push(path),
             Err(e) => {
                 diag.error("export", &format!("slide {} failed: {}", i + 1, e), None);

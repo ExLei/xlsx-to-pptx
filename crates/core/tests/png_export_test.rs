@@ -3,86 +3,8 @@ use vocab_core::types::WordEntry;
 
 // ── Red: SVG generation tests ──
 
-fn make_layout_for_test(
-) -> std::collections::HashMap<String, vocab_core::png_export::PlaceholderLayout> {
-    use vocab_core::png_export::PlaceholderLayout;
-    let mut m = std::collections::HashMap::new();
-    m.insert(
-        "单词".to_string(),
-        PlaceholderLayout {
-            name: "单词".into(),
-            x: 144,
-            y: 144,
-            w: 1728,
-            font_size_pt: 36.0,
-            bold: true,
-            color: image::Rgba([30, 30, 30, 255]),
-            align_center: false,
-            font_family: None,
-            h: 400,
-            text_anchor: "t".into(),
-        },
-    );
-    m.insert(
-        "音标".to_string(),
-        PlaceholderLayout {
-            name: "音标".into(),
-            x: 144,
-            y: 220,
-            w: 1728,
-            font_size_pt: 24.0,
-            bold: false,
-            color: image::Rgba([100, 100, 100, 255]),
-            align_center: false,
-            font_family: None,
-            h: 200,
-            text_anchor: "t".into(),
-        },
-    );
-    m
-}
-
-fn make_full_layout_for_test(
-) -> std::collections::HashMap<String, vocab_core::png_export::PlaceholderLayout> {
-    use vocab_core::png_export::PlaceholderLayout;
-    let mut m = make_layout_for_test();
-    m.insert(
-        "单词释义".to_string(),
-        PlaceholderLayout {
-            name: "单词释义".into(),
-            x: 144,
-            y: 280,
-            w: 1728,
-            font_size_pt: 26.0,
-            bold: false,
-            color: image::Rgba([30, 30, 30, 255]),
-            align_center: false,
-            font_family: None,
-            h: 200,
-            text_anchor: "t".into(),
-        },
-    );
-    m.insert(
-        "例句".to_string(),
-        PlaceholderLayout {
-            name: "例句".into(),
-            x: 144,
-            y: 360,
-            w: 1728,
-            font_size_pt: 24.0,
-            bold: false,
-            color: image::Rgba([30, 30, 30, 255]),
-            align_center: false,
-            font_family: None,
-            h: 200,
-            text_anchor: "t".into(),
-        },
-    );
-    m
-}
-
 #[test]
-fn svg_fields_not_in_layout_fallback_to_default() {
+fn svg_skips_empty_fields() {
     let entry = WordEntry {
         word: "test".into(),
         phonetic: String::new(),
@@ -91,14 +13,13 @@ fn svg_fields_not_in_layout_fallback_to_default() {
         example_definition: String::new(),
         definition: String::new(),
     };
-    let layout = make_layout_for_test(); // only has 单词 + 音标
-    let svg = png_export::render_slide_to_svg(&entry, &layout);
-    // "单词" in layout → present with template position
+    let svg = png_export::render_slide_to_svg(&entry);
     assert!(svg.contains("test"), "SVG should contain word");
-    // "词根词缀" NOT in layout → falls back to default position (not skipped)
-    assert!(
-        svg.contains("test-morph"),
-        "morphology should fall back to default layout, not be skipped"
+    assert!(svg.contains("test-morph"), "SVG should contain morphology");
+    assert_eq!(
+        png_export::count_text_nodes(&svg),
+        2,
+        "only the two filled fields should render"
     );
 }
 
@@ -112,9 +33,8 @@ fn svg_generation_produces_valid_xml() {
         example_definition: String::new(),
         definition: String::new(),
     };
-    let layout = make_layout_for_test();
 
-    let svg = png_export::render_slide_to_svg(&entry, &layout);
+    let svg = png_export::render_slide_to_svg(&entry);
 
     // Must be valid SVG XML
     assert!(
@@ -133,34 +53,6 @@ fn svg_generation_produces_valid_xml() {
 }
 
 #[test]
-fn svg_positions_text_at_layout_coordinates() {
-    let entry = WordEntry {
-        word: "test".into(),
-        phonetic: String::new(),
-        morphology: String::new(),
-        example: String::new(),
-        example_definition: String::new(),
-        definition: String::new(),
-    };
-    let layout = make_layout_for_test();
-
-    let svg = png_export::render_slide_to_svg(&entry, &layout);
-
-    // The "单词" placeholder has x=144, y=144, font_size_pt=36
-    // SVG text element should have x/y attributes near these values
-    assert!(
-        svg.contains("x=\"144\""),
-        "SVG text for 单词 should be at x=144"
-    );
-    // 字号是磅值：1920×1080 画布对应 16in×9in = 1152pt，36pt → 60px
-    // y in SVG includes the font ascent, so it lands near 144 + 60
-    assert!(
-        svg.contains("font-size=\"60\""),
-        "SVG text should use 36pt (=60px) font for 单词"
-    );
-}
-
-#[test]
 fn svg_handles_chinese_characters() {
     let entry = WordEntry {
         word: "苹果".into(),
@@ -170,9 +62,8 @@ fn svg_handles_chinese_characters() {
         example_definition: String::new(),
         definition: "一种水果".into(),
     };
-    let layout = make_full_layout_for_test();
 
-    let svg = png_export::render_slide_to_svg(&entry, &layout);
+    let svg = png_export::render_slide_to_svg(&entry);
 
     // All Chinese characters should be present in the SVG
     assert!(svg.contains("苹果"), "SVG should contain Chinese word");
@@ -196,9 +87,8 @@ fn svg_handles_ipa_characters() {
         example_definition: String::new(),
         definition: String::new(),
     };
-    let layout = make_layout_for_test();
 
-    let svg = png_export::render_slide_to_svg(&entry, &layout);
+    let svg = png_export::render_slide_to_svg(&entry);
 
     // IPA characters (ə, ʌ, ʃ) should be in SVG
     assert!(svg.contains("ə"), "SVG should contain IPA schwa character");
@@ -388,7 +278,7 @@ fn make_full_entry() -> WordEntry {
 #[test]
 fn svg_default_layout_matches_example_template_geometry() {
     let entry = make_full_entry();
-    let svg = png_export::render_slide_to_svg(&entry, &std::collections::HashMap::new());
+    let svg = png_export::render_slide_to_svg(&entry);
 
     // 单词：画布水平居中，72pt → 120px，基线 = 文本框顶 144 + 约 0.8em
     assert!(
@@ -420,16 +310,5 @@ fn svg_default_layout_matches_example_template_geometry() {
     assert!(
         svg.contains(r#"font-size="40""#),
         "标签行应为 24pt → 40px, got: {svg}"
-    );
-}
-
-#[test]
-fn svg_layout_font_size_pt_converts_to_canvas_pixels() {
-    let entry = make_full_entry();
-    let layout = make_layout_for_test(); // 单词 font_size_pt = 36.0
-    let svg = png_export::render_slide_to_svg(&entry, &layout);
-    assert!(
-        svg.contains(r#"font-size="60""#),
-        "36pt 在 1920×1080（16in×9in）画布上等于 60px, got: {svg}"
     );
 }
