@@ -152,10 +152,11 @@ fn svg_positions_text_at_layout_coordinates() {
         svg.contains("x=\"144\""),
         "SVG text for 单词 should be at x=144"
     );
-    // y in SVG usually includes the font ascent, so it should be near 144 + font_size
+    // 字号是磅值：1920×1080 画布对应 16in×9in = 1152pt，36pt → 60px
+    // y in SVG includes the font ascent, so it lands near 144 + 60
     assert!(
-        svg.contains("font-size=\"36\""),
-        "SVG text should use 36pt font for 单词"
+        svg.contains("font-size=\"60\""),
+        "SVG text should use 36pt (=60px) font for 单词"
     );
 }
 
@@ -367,5 +368,68 @@ fn blank_slide_detection_density_below_001_pct_with_text_emits_error() {
     assert!(
         diag_events.contains("slide may be blank"),
         "diag should contain blank-slide warning, got:\n{diag_events}"
+    );
+}
+
+// ── 默认版式：与 template-pptx 示例模板同尺度（1920×1080 画布） ──
+
+/// 六个字段齐全的条目，用于比对整版坐标。
+fn make_full_entry() -> WordEntry {
+    WordEntry {
+        word: "apple".into(),
+        phonetic: "/ˈæpl/".into(),
+        morphology: "a-pple".into(),
+        example: "I eat an apple every day.".into(),
+        example_definition: "我每天吃一个苹果。".into(),
+        definition: "苹果".into(),
+    }
+}
+
+#[test]
+fn svg_default_layout_matches_example_template_geometry() {
+    let entry = make_full_entry();
+    let svg = png_export::render_slide_to_svg(&entry, &std::collections::HashMap::new());
+
+    // 单词：画布水平居中，72pt → 120px，基线 = 文本框顶 144 + 约 0.8em
+    assert!(
+        svg.contains(r#"x="960" y="240" text-anchor="middle""#),
+        "单词 should be centered on the canvas, got: {svg}"
+    );
+    assert!(
+        svg.contains(r#"font-size="120""#),
+        "单词 should render at 72pt → 120px, got: {svg}"
+    );
+    // 音标：居中，28pt → 46.7px
+    assert!(
+        svg.contains(r#"font-size="46.7""#),
+        "音标 should render at 28pt → 46.7px, got: {svg}"
+    );
+
+    // 标签列：左起 240px，正文 24pt → 40px，行距与模板文本框一致
+    for (baseline, label) in [
+        (452, "单词释义"),
+        (548, "词根词缀"),
+        (644, "例句"),
+        (692, "例句释义"),
+    ] {
+        assert!(
+            svg.contains(&format!(r#"x="240" y="{baseline}""#)),
+            "{label} should sit at x=240 y={baseline}, got: {svg}"
+        );
+    }
+    assert!(
+        svg.contains(r#"font-size="40""#),
+        "标签行应为 24pt → 40px, got: {svg}"
+    );
+}
+
+#[test]
+fn svg_layout_font_size_pt_converts_to_canvas_pixels() {
+    let entry = make_full_entry();
+    let layout = make_layout_for_test(); // 单词 font_size_pt = 36.0
+    let svg = png_export::render_slide_to_svg(&entry, &layout);
+    assert!(
+        svg.contains(r#"font-size="60""#),
+        "36pt 在 1920×1080（16in×9in）画布上等于 60px, got: {svg}"
     );
 }

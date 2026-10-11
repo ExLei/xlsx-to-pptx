@@ -41,18 +41,98 @@ pub enum PngExportError {
     #[error("template parse: {0}")]
     TemplateParse(String),
 }
+/// 1920×1080 画布对应 16:9 幻灯片的 16in×9in = 1152pt，即 1pt = 1.667px。
+///
+/// 模板解析出的字号是磅值，写进 SVG 前必须换算成画布像素，否则整版文字会小一半。
+pub const PT_TO_PX: f32 = PNG_W as f32 / (16.0 * 72.0);
+
+/// 无模板时的内置版式槽位。
+struct DefaultSlot {
+    name: &'static str,
+    /// 字段名前缀，与示例模板中的 `单词释义：{{单词释义}}` 一致。
+    label: &'static str,
+    x: f32,
+    /// 基线坐标。
+    baseline: f32,
+    font_px: f32,
+    color: &'static str,
+    centered: bool,
+}
+
+/// 内置版式：与 `template-pptx` 生成的示例模板同坐标（1920×1080 画布）。
+///
+/// 坐标取自示例模板的文本框：单词/音标居中，标签列左起 240px，
+/// 正文 24pt、行距 96px。
+const DEFAULT_LAYOUT: [DefaultSlot; 6] = [
+    DefaultSlot {
+        name: "单词",
+        label: "",
+        x: 960.,
+        baseline: 240.,
+        font_px: 120.,
+        color: "#1e1e1e",
+        centered: true,
+    },
+    DefaultSlot {
+        name: "音标",
+        label: "",
+        x: 960.,
+        baseline: 325.,
+        font_px: 46.7,
+        color: "#646464",
+        centered: true,
+    },
+    DefaultSlot {
+        name: "单词释义",
+        label: "单词释义：",
+        x: 240.,
+        baseline: 452.,
+        font_px: 40.,
+        color: "#1e1e1e",
+        centered: false,
+    },
+    DefaultSlot {
+        name: "词根词缀",
+        label: "词根词缀：",
+        x: 240.,
+        baseline: 548.,
+        font_px: 40.,
+        color: "#1e1e1e",
+        centered: false,
+    },
+    DefaultSlot {
+        name: "例句",
+        label: "例句：",
+        x: 240.,
+        baseline: 644.,
+        font_px: 40.,
+        color: "#1e1e1e",
+        centered: false,
+    },
+    DefaultSlot {
+        name: "例句释义",
+        label: "例句释义：",
+        x: 240.,
+        baseline: 692.,
+        font_px: 40.,
+        color: "#646464",
+        centered: false,
+    },
+];
+
 /// Render a single slide as an SVG string for resvg-based PNG export.
 ///
-/// Generates a 1920×1080 SVG with text elements positioned according to
-/// the provided layout (from PPTX template parsing). Fields without layout
-/// entries are rendered with sensible defaults.
+/// Generates a 1920×1080 SVG. Fields present in `layout` use the template's
+/// coordinates (with `font_size_pt` converted to canvas pixels); the remaining
+/// fields fall back to [`DEFAULT_LAYOUT`], which mirrors the example template's
+/// geometry.
 pub fn render_slide_to_svg(
     entry: &WordEntry,
     layout: &HashMap<String, PlaceholderLayout>,
 ) -> String {
     let mut svg = String::new();
-    let w = 1920u32;
-    let h = 1080u32;
+    let w = PNG_W;
+    let h = PNG_H;
     svg.push_str(&format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}" width="{}" height="{}">"##,
         w, h, w, h,
@@ -63,67 +143,74 @@ pub fn render_slide_to_svg(
         w, h,
     ));
 
-    let default_color = "#1e1e1e";
-    let gray_color = "#646464";
-    let fields: [(&str, &str, f32, &str); 6] = [
-        ("单词", &entry.word, 72.0, default_color),
-        ("音标", &entry.phonetic, 28.0, gray_color),
-        ("单词释义", &entry.definition, 26.0, default_color),
-        ("词根词缀", &entry.morphology, 24.0, default_color),
-        ("例句", &entry.example, 24.0, default_color),
-        ("例句释义", &entry.example_definition, 22.0, gray_color),
+    let fields: [(&str, &str); 6] = [
+        ("单词", &entry.word),
+        ("音标", &entry.phonetic),
+        ("单词释义", &entry.definition),
+        ("词根词缀", &entry.morphology),
+        ("例句", &entry.example),
+        ("例句释义", &entry.example_definition),
     ];
 
-    let mut default_y = 140i32;
-    let margin = 80i32;
-    let _text_w = (w as i32 - margin * 2) as u32;
-
-    for (name, value, _default_size, _color) in &fields {
+    for (name, value) in fields {
         if value.is_empty() {
             continue;
         }
-        if let Some(pl) = layout.get(*name) {
-            // Use layout from template
-            let font_weight = if pl.bold { "bold" } else { "normal" };
-            let color_hex = format!("#{:02x}{:02x}{:02x}", pl.color[0], pl.color[1], pl.color[2]);
-            let font_family = pl.font_family.as_deref().unwrap_or("sans-serif");
-            let text_y = match pl.text_anchor.as_str() {
-                "ctr" => pl.y + pl.h as i32 / 2 + pl.font_size_pt as i32 / 3,
-                "b" => pl.y + pl.h as i32 - 4,
-                _ => pl.y + pl.font_size_pt as i32, // "t" (top) — default
-            };
-            svg.push_str(&format!(
-                r##"<text x="{}" y="{text_y}" font-family="{font_family}, sans-serif" font-size="{}" font-weight="{font_weight}" fill="{color_hex}">{}</text>"##,
-                pl.x, pl.font_size_pt,
-                xml_escape(value),
-            ));
-        } else {
-            // Default layout: center word/phonetic, left-align others
-            let (label, size, color_hex) = match *name {
-                "单词" => ("", 72.0, default_color),
-                "音标" => ("", 28.0, gray_color),
-                "单词释义" => ("单词释义：", 26.0, default_color),
-                "词根词缀" => ("词根词缀：", 24.0, default_color),
-                "例句" => ("例句：", 24.0, default_color),
-                "例句释义" => ("例句释义：", 22.0, gray_color),
-                _ => continue,
-            };
-            let text = format!("{label}{value}");
-            let x = if *name == "单词" || *name == "音标" {
-                (w as i32 / 2 - 200).max(0)
-            } else {
-                margin
-            };
-            svg.push_str(&format!(
-                r#"<text x="{x}" y="{default_y}" font-family="sans-serif" font-size="{size}" fill="{color_hex}">{}</text>"#,
-                xml_escape(&text),
-            ));
-            default_y += if *name == "单词" { 90 } else { 50 };
+        match layout.get(name) {
+            // 模板版式：坐标与锚点来自模板，字号由磅换算成画布像素
+            Some(pl) => {
+                let font_px = pl.font_size_pt * PT_TO_PX;
+                let baseline = match pl.text_anchor.as_str() {
+                    "ctr" => pl.y as f32 + pl.h as f32 / 2. + font_px / 3.,
+                    "b" => pl.y as f32 + pl.h as f32 - 4.,
+                    _ => pl.y as f32 + font_px, // "t"（默认）
+                };
+                let font_weight = if pl.bold { "bold" } else { "normal" };
+                let color_hex =
+                    format!("#{:02x}{:02x}{:02x}", pl.color[0], pl.color[1], pl.color[2]);
+                let font_family = pl.font_family.as_deref().unwrap_or("sans-serif");
+                svg.push_str(&format!(
+                    r##"<text x="{}" y="{}" font-family="{font_family}, sans-serif" font-size="{}" font-weight="{font_weight}" fill="{color_hex}">{}</text>"##,
+                    fmt_px(pl.x as f32),
+                    fmt_px(baseline),
+                    fmt_px(font_px),
+                    xml_escape(value),
+                ));
+            }
+            // 内置版式：与示例模板同坐标
+            None => {
+                let Some(slot) = DEFAULT_LAYOUT.iter().find(|slot| slot.name == name) else {
+                    continue;
+                };
+                let text = format!("{}{value}", slot.label);
+                let anchor = if slot.centered {
+                    r#" text-anchor="middle""#
+                } else {
+                    ""
+                };
+                svg.push_str(&format!(
+                    r#"<text x="{}" y="{}"{anchor} font-family="sans-serif" font-size="{}" fill="{}">{}</text>"#,
+                    fmt_px(slot.x),
+                    fmt_px(slot.baseline),
+                    fmt_px(slot.font_px),
+                    slot.color,
+                    xml_escape(&text),
+                ));
+            }
         }
     }
 
     svg.push_str("</svg>");
     svg
+}
+
+/// 画布像素保留到 0.1，整数不写小数尾巴（120 而不是 120.0）。
+fn fmt_px(value: f32) -> String {
+    if (value - value.round()).abs() < 0.05 {
+        format!("{}", value.round() as i32)
+    } else {
+        format!("{value:.1}")
+    }
 }
 
 /// Escape special XML characters in text for SVG embedding
