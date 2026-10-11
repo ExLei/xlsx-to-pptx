@@ -644,6 +644,28 @@ impl VocabApp {
         cx.notify();
     }
 
+    /// 在浅色/深色之间切换。
+    ///
+    /// 主题模式属于框架的全局 `Theme`，这里只发一次切换请求，不缓存副本；
+    /// 同时把原生窗口边框也切到同一侧，避免暗色界面配亮色标题栏。
+    pub fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dark = cx.theme().is_dark();
+        Theme::change(
+            if dark {
+                ThemeMode::Light
+            } else {
+                ThemeMode::Dark
+            },
+            Some(window),
+            cx,
+        );
+        cx.set_window_appearance(Some(if dark {
+            WindowAppearance::Light
+        } else {
+            WindowAppearance::Dark
+        }));
+    }
+
     pub fn cancel_job(&mut self, cx: &mut Context<Self>) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
@@ -778,6 +800,7 @@ impl VocabApp {
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.status.is_busy();
         let has_entries = self.entry_count(cx) > 0;
+        let dark = cx.theme().is_dark();
         let (current, total) = self.progress;
         let percent = if total > 0 {
             current as f32 / total as f32 * 100.
@@ -831,16 +854,11 @@ impl VocabApp {
                             .child(status_text),
                     )
                     .when(diag_issues > 0, |this| {
-                        this.child(
-                            div()
-                                .text_sm()
-                                .text_color(diag_color)
-                                .child(format!(
-                                    "诊断：警告 {} · 错误 {}",
-                                    self.diag.warnings(),
-                                    self.diag.errors()
-                                )),
-                        )
+                        this.child(div().text_sm().text_color(diag_color).child(format!(
+                            "诊断：警告 {} · 错误 {}",
+                            self.diag.warnings(),
+                            self.diag.errors()
+                        )))
                     })
                     .when(busy && total > 0, |this| {
                         this.child(
@@ -864,6 +882,20 @@ impl VocabApp {
                 h_flex()
                     .gap_2()
                     .items_center()
+                    .child(
+                        Button::new("theme-toggle")
+                            .ghost()
+                            .icon(if dark { IconName::Sun } else { IconName::Moon })
+                            .accessibility_label("切换明暗模式")
+                            .tooltip(if dark {
+                                "切换到浅色模式"
+                            } else {
+                                "切换到深色模式"
+                            })
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.toggle_theme(window, cx)),
+                            ),
+                    )
                     .child(
                         Button::new("export-png")
                             .outline()

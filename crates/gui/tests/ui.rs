@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{
     px, size, AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, WindowBounds,
@@ -118,4 +119,21 @@ async fn types_a_csv_path_and_generates_a_pptx(cx: &mut TestAppContext) {
     let bytes = std::fs::read(&pptx).expect("read pptx");
     assert!(bytes.starts_with(b"PK"), "PPTX 应为 ZIP 容器");
     assert!(bytes.len() > 1000, "PPTX 不应为空文件");
+}
+
+/// 明暗开关：点击换到另一模式，再点回到原模式。
+#[gpui_kit::test]
+fn theme_toggle_switches_between_light_and_dark(cx: &mut TestAppContext) {
+    let (handle, _view) = open_app(cx);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let before = cx.theme().mode;
+        window.click("theme-toggle", cx);
+        assert_ne!(cx.theme().mode, before, "点击开关后主题模式应改变");
+        window.render_frame(cx);
+        window.click("theme-toggle", cx);
+        assert_eq!(cx.theme().mode, before, "再点一次应切回原模式");
+    })
+    .unwrap();
 }

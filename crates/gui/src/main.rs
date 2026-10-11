@@ -17,6 +17,7 @@ mod win_console {
     }
 }
 
+use gpui_kit::component::Theme;
 use gpui_kit::*;
 use gui::app;
 
@@ -45,6 +46,8 @@ fn run_gui() {
         .run(|cx| {
             // 必须先于任何组件创建，注册主题、遮罩层与输入设施。
             gpui_kit::init(cx);
+            // 框架默认停在浅色；按系统的明暗设置开局，之后的切换由视图里的开关负责。
+            Theme::sync_system_appearance(None, cx);
 
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
