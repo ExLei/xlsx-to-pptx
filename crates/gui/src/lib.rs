@@ -21,6 +21,19 @@ use gpui_kit::*;
 /// 应用名（窗口标题与界面标题的唯一来源）。
 pub const APP_TITLE: &str = "英语助记卡片生成";
 
+/// `X2P_TEXT_MODE=gray|subpixel` 覆盖文本渲染模式；未设置或无法识别时返回 `None`（平台默认）。
+fn text_mode_override() -> Option<TextRenderingMode> {
+    match std::env::var("X2P_TEXT_MODE")
+        .ok()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gray" | "grayscale" => Some(TextRenderingMode::Grayscale),
+        "subpixel" | "cleartype" => Some(TextRenderingMode::Subpixel),
+        _ => None,
+    }
+}
+
 /// GUI 入口（由组合根在无参数时调用）。
 ///
 /// 装配顺序：`application` → `init`（主题/遮罩/输入设施）→ 跟随系统明暗 → 开窗；
@@ -34,6 +47,13 @@ pub fn run() -> ExitCode {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // 诊断/兼容开关：文本渲染模式可由环境变量覆盖（未设置 = 平台默认，行为不变）。
+            // Windows 平台默认可走 ClearType 子像素路径；若该路径在目标机异常（典型症状：
+            // 界面几何与图标正常但全部文字不显示），用 X2P_TEXT_MODE=gray 切到灰度路径验证。
+            if let Some(mode) = text_mode_override() {
+                eprintln!("[x2p] 文本渲染模式覆盖：{mode:?}");
+                cx.set_text_rendering_mode(mode);
+            }
             // 开局跟随系统明暗；之后的切换由状态栏的开关负责（视图侧，不进状态机）。
             Theme::sync_system_appearance(None, cx);
 
