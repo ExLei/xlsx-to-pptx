@@ -784,6 +784,13 @@ impl VocabApp {
         } else {
             0.
         };
+        // 核心把告警写进 DiagStore（例如 CSV 无效字节被替换），这里给出可见入口。
+        let diag_issues = self.diag.warnings() + self.diag.errors();
+        let diag_color = if self.diag.errors() > 0 {
+            cx.theme().danger
+        } else {
+            cx.theme().warning
+        };
 
         let (status_text, status_color) = match &self.status {
             Status::Idle => (
@@ -823,6 +830,18 @@ impl VocabApp {
                             .text_color(status_color)
                             .child(status_text),
                     )
+                    .when(diag_issues > 0, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(diag_color)
+                                .child(format!(
+                                    "诊断：警告 {} · 错误 {}",
+                                    self.diag.warnings(),
+                                    self.diag.errors()
+                                )),
+                        )
+                    })
                     .when(busy && total > 0, |this| {
                         this.child(
                             ProgressBar::new("job-progress")
