@@ -7,6 +7,8 @@
 //!
 //! M2 起填充；入口形态：双击（无参数）→ GUI。
 
+pub mod state;
+
 use std::process::ExitCode;
 
 /// GUI 入口（由组合根在无参数时调用）。
