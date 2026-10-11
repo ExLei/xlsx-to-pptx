@@ -13,3 +13,21 @@ lto = true          # link-time optimization
 codegen-units = 1   # better optimization
 panic = "abort"     # remove unwind tables
 strip = true        # strip symbols
+
+# GPUI 栈按性能优化：体积优先会让渲染、布局与文本排版明显变慢。
+[profile.release.package.gpui-pre]
+opt-level = 3
+[profile.release.package."gpui-pre-platform"]
+opt-level = 3
+[profile.release.package.gpui-component]
+opt-level = 3
+[profile.release.package.gpui-kit]
+opt-level = 3
+[profile.release.package.gpui-kit-assets]
+opt-level = 3
+[profile.release.package.rustybuzz]
+opt-level = 3
+[profile.release.package.taffy]
+opt-level = 3
+[profile.release.package.ttf-parser]
+opt-level = 3

@@ -1,143 +1,153 @@
-use std::sync::atomic::Ordering;
+//! 预览区：虚拟滚动词汇表与空状态。
 
-use egui::{Color32, ProgressBar, RichText, Ui};
-use egui_extras::{Column, TableBuilder};
+use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
+use gpui_kit::component::*;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
 
-use crate::app::{AppState, VocabPptApp};
+use vocab_core::types::WordEntry;
 
-const PREVIEW_LIMIT: usize = 100;
-const COLUMNS: [&str; 6] = ["单词", "音标", "词根", "例句", "释义", "单词释义"];
+use crate::app::VocabApp;
 
-pub fn show(ui: &mut Ui, app: &mut VocabPptApp) {
-    ui.heading("状态");
+/// 列定义：键、表头、初始宽度（rem 倍数，跟随主题基准字号缩放）。
+const COLUMNS: [(&str, &str, f32); 6] = [
+    ("word", "单词", 8.),
+    ("phonetic", "音标", 10.),
+    ("morphology", "词根词缀", 12.),
+    ("example", "例句", 22.),
+    ("example_definition", "例句释义", 14.),
+    ("definition", "单词释义", 14.),
+];
 
-    match &app.state {
-        AppState::Idle => {
-            ui.label(RichText::new("请选择文件").color(Color32::GRAY));
-        }
-        AppState::Loading { .. } => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("加载中...");
-            });
-        }
-        AppState::Preview { entries } => {
-            let count = entries.len();
-            let display_count = count.min(PREVIEW_LIMIT);
-            ui.label(format!("共 {count} 条记录", count = count));
-            if app.is_exporting_png() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("正在导出PNG...").color(Color32::GRAY));
-                    if ui.button("取消").clicked() {
-                        if let Some(ref f) = app.cancel_png_flag {
-                            f.store(true, Ordering::Relaxed);
-                        }
-                    }
-                });
-                ui.separator();
-            }
-            if count > PREVIEW_LIMIT {
-                ui.label(
-                    RichText::new(format!("(仅显示前 {PREVIEW_LIMIT} 行)")).color(Color32::GRAY),
-                );
-            }
+/// 词汇表数据源；行渲染只读已读取的条目，滚动与选择由表格状态负责。
+pub struct PreviewDelegate {
+    entries: Vec<WordEntry>,
+    columns: Vec<Column>,
+    loading: bool,
+}
 
-            let max_h = ui.available_height().max(100.0);
-            egui::ScrollArea::vertical()
-                .max_height(max_h)
-                .show(ui, |ui| {
-                    let available_width = ui.available_width();
-                    let col_width = available_width / 6.0 - 4.0;
-
-                    TableBuilder::new(ui)
-                        .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::initial(col_width).resizable(true))
-                        .column(Column::initial(col_width).resizable(true))
-                        .column(Column::initial(col_width).resizable(true))
-                        .column(Column::initial(col_width).resizable(true))
-                        .column(Column::initial(col_width).resizable(true))
-                        .column(Column::initial(col_width).resizable(true))
-                        .header(20.0, |mut header| {
-                            for col_name in &COLUMNS {
-                                header.col(|ui| {
-                                    ui.strong(*col_name);
-                                });
-                            }
-                        })
-                        .body(|body| {
-                            body.rows(20.0, display_count, |mut row| {
-                                let idx = row.index();
-                                let entry = &entries[idx];
-                                row.col(|ui| {
-                                    ui.label(truncate(&entry.word, 20));
-                                });
-                                row.col(|ui| {
-                                    ui.label(truncate(&entry.phonetic, 20));
-                                });
-                                row.col(|ui| {
-                                    ui.label(truncate(&entry.morphology, 20));
-                                });
-                                row.col(|ui| {
-                                    ui.label(truncate(&entry.example, 30));
-                                });
-                                row.col(|ui| {
-                                    ui.label(truncate(&entry.example_definition, 20));
-                                });
-                                row.col(|ui| {
-                                    ui.label(truncate(&entry.definition, 30));
-                                });
-                            });
-                        });
-                });
-        }
-        AppState::Generating => {
-            let (current, total) = app.gen_progress().unwrap_or((0, 0));
-            let pct = if total > 0 {
-                current as f32 / total as f32
-            } else {
-                0.0
-            };
-            ui.horizontal(|ui| {
-                ui.add(ProgressBar::new(pct).desired_width(300.0));
-                ui.label(format!("{current}/{total}"));
-                if ui.button("取消").clicked() {
-                    if let Some(ref flag) = app.cancel_flag {
-                        flag.store(true, Ordering::Relaxed);
-                    }
-                }
-            });
-        }
-        AppState::Done { count } => {
-            ui.label(
-                RichText::new(format!("成功生成 {count} 张")).color(Color32::from_rgb(0, 160, 0)),
-            );
-        }
-        AppState::Error { message } => {
-            ui.label(RichText::new(message).color(Color32::RED));
+impl PreviewDelegate {
+    pub fn new(rem: Pixels) -> Self {
+        Self {
+            entries: Vec::new(),
+            columns: COLUMNS
+                .iter()
+                .map(|(key, name, width)| Column::new(*key, *name).width(rem * *width))
+                .collect(),
+            loading: false,
         }
     }
 
-    // ── 诊断摘要 ──
-    let total = app.diag.event_count();
-    if total > 0 {
-        ui.separator();
-        ui.heading("诊断");
-        let warns = app.diag.warnings();
-        let errs = app.diag.errors();
-        let infos = total - warns - errs;
-        ui.label(format!(
-            "事件: {} 条 (信息 {}, 警告 {}, 错误 {})",
-            total, infos, warns, errs
-        ));
+    pub fn entries(&self) -> &[WordEntry] {
+        &self.entries
+    }
+
+    pub fn set_entries(&mut self, entries: Vec<WordEntry>) {
+        self.entries = entries;
+    }
+
+    pub fn set_loading(&mut self, loading: bool) {
+        self.loading = loading;
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let cleaned: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        format!("{}…", cleaned)
-    } else {
-        cleaned
+impl TableDelegate for PreviewDelegate {
+    fn columns_count(&self, _: &App) -> usize {
+        self.columns.len()
     }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.entries.len()
+    }
+
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
+    }
+
+    fn loading(&self, _: &App) -> bool {
+        self.loading
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let text = self
+            .entries
+            .get(row_ix)
+            .map(|entry| match self.columns[col_ix].key.as_ref() {
+                "word" => entry.word.clone(),
+                "phonetic" => entry.phonetic.clone(),
+                "morphology" => entry.morphology.clone(),
+                "example" => entry.example.clone(),
+                "example_definition" => entry.example_definition.clone(),
+                "definition" => entry.definition.clone(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+
+        div()
+            .min_w_0()
+            .w_full()
+            .truncate()
+            .when(col_ix == 0, |this| this.font_weight(FontWeight::MEDIUM))
+            .child(text)
+    }
+
+    /// 空表状态说明下一步操作，而不是只留一片空白。
+    fn render_empty(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(IconName::Inbox).size_8())
+            .child("选择 Excel 或 CSV 文件后在此预览词汇")
+    }
+}
+
+/// 预览区：标题行 + 数据表。
+pub fn render(app: &VocabApp, cx: &mut Context<VocabApp>) -> impl IntoElement {
+    let count = app.entry_count(cx);
+
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .gap_2()
+        .px_4()
+        .pb_2()
+        .child(
+            h_flex()
+                .gap_3()
+                .items_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("预览"),
+                )
+                .when(count > 0, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("共 {count} 条记录")),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(DataTable::new(&app.preview).stripe(true).bordered(true)),
+        )
 }

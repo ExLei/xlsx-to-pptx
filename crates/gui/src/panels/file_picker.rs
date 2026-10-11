@@ -1,53 +1,101 @@
-use egui::{ComboBox, TextEdit, Ui};
+//! 输入区：输入文件、格式、工作表与 CSV 编码。
 
-use crate::app::{InputMode, VocabPptApp};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::form::{Field, Form};
+use gpui_kit::component::input::Input;
+use gpui_kit::component::radio::RadioGroup;
+use gpui_kit::component::select::Select;
+use gpui_kit::component::*;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
 
-pub fn show(ui: &mut Ui, app: &mut VocabPptApp) {
-    ui.heading("输入");
+use crate::app::{InputMode, VocabApp};
 
-    // File path row
-    ui.horizontal(|ui| {
-        ui.label("文件:");
-        let w = ui.available_width() - 70.0;
-        ui.add_sized(
-            [w, 20.0],
-            TextEdit::singleline(&mut app.input_path).hint_text("选择 Excel 或 CSV 文件"),
-        );
-        if ui.button("浏览...").clicked() {
-            app.pick_input_file = true;
-        }
-    });
+pub fn render(app: &VocabApp, window: &mut Window, cx: &mut Context<VocabApp>) -> impl IntoElement {
+    let sheet_count = app.sheets.len();
 
-    // Format radio + sheet/encoding
-    ui.horizontal(|ui| {
-        ui.label("格式:");
-        ui.radio_value(&mut app.input_mode, InputMode::Excel, "Excel");
-        ui.radio_value(&mut app.input_mode, InputMode::Csv, "CSV");
+    let secondary = match app.input_mode {
+        // Excel：工作表选择器，未读到工作表时禁用
+        InputMode::Excel => h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("工作表"),
+            )
+            .child(
+                Select::new(&app.sheet_select)
+                    .w_40()
+                    .placeholder("（无工作表）")
+                    .disabled(sheet_count == 0),
+            )
+            .into_any_element(),
+        // CSV：文本编码
+        InputMode::Csv => h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("编码"),
+            )
+            .child(Select::new(&app.encoding_select).w_32())
+            .into_any_element(),
+    };
 
-        match app.input_mode {
-            InputMode::Excel => {
-                ui.label("工作表:");
-                if app.sheets.is_empty() {
-                    ui.label("(无)");
-                } else {
-                    ComboBox::from_id_salt("sheet")
-                        .selected_text(&app.selected_sheet)
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            for s in &app.sheets.clone() {
-                                ui.selectable_value(&mut app.selected_sheet, s.clone(), s);
-                            }
-                        });
-                }
-            }
-            InputMode::Csv => {
-                ui.label("编码:");
-                ui.add_sized([80.0, 20.0], TextEdit::singleline(&mut app.csv_encoding));
-            }
-        }
-    });
-    if !app.input_path.is_empty()
-        && ui.button("刷新").clicked() {
-            app.needs_load = true;
-        }
+    v_flex().px_4().pt_4().child(
+        Form::horizontal()
+            .label_width(window.rem_size() * 5.)
+            .child(
+                Field::new().label("输入文件").child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .w_full()
+                        .child(
+                            Input::new(&app.input_file)
+                                .id("input-file")
+                                .cleanable(true)
+                                .w_full(),
+                        )
+                        .child(
+                            Button::new("pick-input")
+                                .icon(IconName::FolderOpen)
+                                .label("浏览…")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.pick_input(window, cx)),
+                                ),
+                        ),
+                ),
+            )
+            .child(
+                Field::new().label("输入格式").child(
+                    h_flex()
+                        .gap_6()
+                        .items_center()
+                        .w_full()
+                        .child(
+                            RadioGroup::new("input-mode")
+                                .children(["Excel", "CSV"])
+                                .selected_index(Some(app.input_mode.index()))
+                                .on_change(cx.listener(|this, ix, window, cx| {
+                                    this.set_input_mode(*ix, window, cx)
+                                })),
+                        )
+                        .child(secondary)
+                        .child(
+                            Button::new("reload-input")
+                                .ghost()
+                                .icon(IconName::RefreshCw)
+                                .tooltip("重新读取输入文件")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.reload(window, cx)),
+                                ),
+                        ),
+                ),
+            ),
+    )
 }

@@ -1,35 +1,76 @@
-use egui::{TextEdit, Ui};
+//! 输出区：输出路径、PPTX 模板与内置模板工具。
 
-use crate::app::VocabPptApp;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::form::{Field, Form};
+use gpui_kit::component::input::Input;
+use gpui_kit::component::*;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
 
-/// Returns true if output path is non-empty (enables generate button).
-pub fn show(ui: &mut Ui, app: &mut VocabPptApp) -> bool {
-    ui.heading("输出");
+use crate::app::VocabApp;
 
-    ui.horizontal(|ui| {
-        ui.label("输出路径:");
-        let w = ui.available_width() - 70.0;
-        ui.add_sized(
-            [w, 20.0],
-            TextEdit::singleline(&mut app.output_path).hint_text("output.pptx"),
-        );
-        if ui.button("浏览...").clicked() {
-            app.pick_output_file = true;
-        }
-    });
+pub fn render(app: &VocabApp, window: &mut Window, cx: &mut Context<VocabApp>) -> impl IntoElement {
+    let busy = app.status.is_busy();
 
-    ui.horizontal(|ui| {
-        ui.label("PPTX模板:");
-        let w = ui.available_width() - 70.0;
-        ui.add_sized(
-            [w, 20.0],
-            TextEdit::singleline(&mut app.template_path)
-                .hint_text("(可选) 含 {{占位符}} 的自定义模板"),
-        );
-        if ui.button("浏览...").clicked() {
-            app.pick_template_file = true;
-        }
-    });
-
-    !app.output_path.is_empty()
+    v_flex().px_4().pt_3().child(
+        Form::horizontal()
+            .label_width(window.rem_size() * 5.)
+            .child(
+                Field::new().label("输出文件").child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .w_full()
+                        .child(Input::new(&app.output_file).cleanable(true).w_full())
+                        .child(
+                            Button::new("pick-output")
+                                .icon(IconName::FolderOpen)
+                                .label("浏览…")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.pick_output(window, cx)),
+                                ),
+                        ),
+                ),
+            )
+            .child(
+                Field::new().label("PPTX 模板").child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .w_full()
+                        .child(Input::new(&app.template_file).cleanable(true).w_full())
+                        .child(
+                            Button::new("pick-template")
+                                .icon(IconName::FolderOpen)
+                                .label("浏览…")
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.pick_template(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("example-template")
+                                .ghost()
+                                .label("示例模板")
+                                .icon(IconName::FileText)
+                                .disabled(busy)
+                                .tooltip("生成含占位符的示例 PPTX 模板并打开")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_example_pptx(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("excel-template")
+                                .ghost()
+                                .label("Excel 模板")
+                                .icon(IconName::FileText)
+                                .disabled(busy)
+                                .tooltip("生成 Excel 词汇表模板并打开")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_excel_template(window, cx)
+                                })),
+                        ),
+                ),
+            ),
+    )
 }

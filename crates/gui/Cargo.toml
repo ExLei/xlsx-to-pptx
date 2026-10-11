@@ -11,11 +11,13 @@ path = "src/main.rs"
 [dependencies]
 vocab_core = { path = "../core" }
 cli = { path = "../cli" }
-eframe = "0.31"
-egui = "0.31"
-egui_extras = "0.31"
+gpui-kit = "0.7"
 rfd = "0.15"
 open = "5"
+
+[dev-dependencies]
+gpui-kit = { version = "0.7", features = ["test-support"] }
+tempfile = "3"
 
 
 [build-dependencies]

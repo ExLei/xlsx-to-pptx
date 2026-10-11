@@ -22,7 +22,7 @@ Excel/CSV 词汇表 → 16:9 PPTX 单词幻灯片，一键生成。
 1. **选择输入文件** — 支持 .xlsx / .csv，自动检测格式
 2. **选择工作表** — 下拉菜单列出所有 sheet（Excel 模式）
 3. **（可选）选择 PPTX 模板** — 含 `{{占位符}}` 的自定义版式
-4. **数据预览** — 自动加载前 100 行
+4. **数据预览** — 表格虚拟滚动，可直接浏览全部条目
 5. **生成PPT** — 显示进度，可随时取消
 6. **导出PNG** — 有预览数据即可导出，内部自动生成 PPTX 再渲染
 
@@ -119,11 +119,20 @@ Excel 需包含以下列（CSV 同理）：
 # 开发
 cargo build && cargo test --workspace
 
-# Windows 交叉编译（需 mingw-w64）
-cargo build --release --target x86_64-pc-windows-gnu
+# Windows（需 MSVC 工具链，GPUI 不支持 GNU 目标）
+cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-产物：`target/x86_64-pc-windows-gnu/release/英语助记卡片生成.exe` (~6-9 MB)
+Linux 构建需要 GUI 系统依赖（gpui 后端）：
+
+```bash
+# Ubuntu 24.04
+sudo apt install -y gcc g++ clang libfontconfig-dev libwayland-dev \
+  libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
+  libssl-dev libzstd-dev libvulkan1
+```
+
+产物：`target/release/英语助记卡片生成`；Windows 为 `target/x86_64-pc-windows-msvc/release/英语助记卡片生成.exe`
 
 ## 架构
 
@@ -142,14 +151,19 @@ crates/
 │   └── types.rs            # WordEntry, 错误类型
 ├── cli/               # CLI 逻辑 (clap)，含 diag 诊断子命令
 │   └── lib.rs
-└── gui/               # GUI (egui/eframe) + 统一入口
-    ├── main.rs             # args>1 → CLI；否则 → GUI + 系统字体
-    ├── app.rs              # 状态机
+└── gui/               # GUI (gpui-kit) + 统一入口
+    ├── main.rs             # args>1 → CLI；否则 → GUI 窗口
+    ├── app.rs              # 状态机、后台任务管线、窗口根布局
+    ├── lib.rs              # 视图与面板，供集成测试引用
     └── panels/
-        ├── file_picker.rs
-        ├── data_preview.rs
-        └── output_config.rs
+        ├── file_picker.rs  # 输入文件、格式、工作表、编码
+        ├── data_preview.rs # 虚拟滚动预览表（DataTable）
+        └── output_config.rs # 输出路径、模板与内置模板工具
 ```
+
+UI 由 [gpui-kit](https://github.com/longbridge/gpui-kit) 构建：`Form`/`Input`/`Select`/`RadioGroup`
+组成输入区，`DataTable` 做虚拟滚动预览，`Progress` + `Button` 承担生成进度与取消，
+窗口通知层报告生成/导出结果。字体直接使用系统字体，无需手工加载。
 
 ## 诊断
 

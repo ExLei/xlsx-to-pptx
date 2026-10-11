@@ -37,11 +37,20 @@ crates/
 │   └── tests/               # 集成测试
 ├── cli/                     # CLI (clap)，作为库供 GUI 调用
 │   └── src/lib.rs           # pub fn run() + diag 子命令
-└── gui/                     # GUI (egui/eframe)
+└── gui/                     # GUI (gpui-kit) + 统一入口
     └── src/
-        ├── main.rs          # 入口：argc>1 → CLI，否则 → GUI
-        ├── app.rs           # 状态机：Idle→Loading→Preview→Generating→Done/Error
+        ├── main.rs          # 入口：argc>1 → CLI，否则 → GUI 窗口
+        ├── lib.rs           # 视图与面板（集成测试经此引用）
+        ├── app.rs           # 状态机：Idle→Loading→Ready→Generating/Done/Failed
         └── panels/          # file_picker, data_preview, output_config
+```
+
+### GUI 约定（gpui-kit）
+
+- 组件状态归视图持有：`InputState` / `SelectState` / `TableState` 都是 `Entity`，`render` 里只构建元素。
+- 耗时操作走 `cx.background_spawn`，前台任务轮询进度后回到 `update_in` 更新状态；同时只允许一个后台任务。
+- 界面走 `cx.theme()` 语义色与 rem 尺寸助手（`p_4`、`w_40`、`text_sm`），不写死颜色与像素。
+- UI 集成测试放 `crates/gui/tests/`，用 `#[gpui_kit::test]` 在无头窗口里驱动真实事件。
 ```
 
 ---
@@ -284,7 +293,7 @@ pub fn export_entries_to_png_with_cancel(entries, output_dir, cancel, diag) -> R
 ### 禁止新增
 
 - `rusqlite` — 用 NDJSON + `diag` 子命令替代
-- 任何 UI 框架之外的 GUI 依赖
+- 任何 UI 框架之外的 GUI 依赖；GUI 只用 `gpui-kit`（原生文件对话框用 `rfd`）
 
 ### 可复用
 
