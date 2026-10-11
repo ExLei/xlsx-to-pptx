@@ -40,11 +40,15 @@ pub fn make_excel_template(output: OutputPlan, cx: &mut OpContext) -> OpResult<A
 /// 内置示例产物的字节构造（Excel 模板为静态资产；PPTX 模板由 `pptx` 包生成）。
 mod examples {
     use crate::diag::Diag;
-    use crate::platform::pptx::PptxError;
+    use crate::domain::schema::FIELDS;
+    use crate::platform::pptx::{Package, PptxError, EMBEDDED_TEMPLATE};
 
-    /// 示例 PPTX：内嵌版式 → 标记替换为 `{{占位符}}`。
-    pub(super) fn example_template_bytes(_diag: &Diag) -> Result<Vec<u8>, PptxError> {
-        unimplemented!("M1：由 pptx::Package 将内嵌标记替换为 {{占位符}} 后导出")
+    /// 示例 PPTX：内嵌版式 → 六标记替换为 `{{占位符}}`（标签文本保留在版式里）。
+    pub(super) fn example_template_bytes(diag: &Diag) -> Result<Vec<u8>, PptxError> {
+        let mut package = Package::open_bytes(EMBEDDED_TEMPLATE, diag)?;
+        let pairs: Vec<(&str, &str)> = FIELDS.iter().map(|meta| (meta.marker, meta.placeholder)).collect();
+        package.replace_text(&pairs, diag)?;
+        package.to_bytes()
     }
 
     /// Excel 词表模板：静态资产（表头与字段表一致）。
